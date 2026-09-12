@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/turbovault.svg)](https://crates.io/crates/turbovault)
 [![Docs.rs](https://docs.rs/turbovault/badge.svg)](https://docs.rs/turbovault)
-[![License](https://img.shields.io/crates/l/turbovault.svg)](https://github.com/epistates/turbovault/blob/main/LICENSE)
+[![License](https://img.shields.io/crates/l/turbovault.svg)](https://github.com/samuelueluel/turbovault/blob/main/LICENSE)
 [![Rust 1.90+](https://img.shields.io/badge/rust-1.90%2B-orange.svg)](https://www.rust-lang.org/)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/Epistates/turbovault)
 
@@ -23,10 +23,10 @@ Build your own applications, search engines, or custom MCP servers using our mod
 - **SOTA Standards**: Fully supports Obsidian-flavored Markdown (wikilinks, embeds, callouts).
 
 ### 2. As a Ready-to-Use MCP Server (For Users)
-Transform your Obsidian vault into an intelligent knowledge system immediately. Connect TurboVault to Claude Desktop or any MCP-compatible client to gain **74 specialized tools** for your notes.
+Transform your Obsidian vault into an intelligent knowledge system immediately. Connect TurboVault to Claude Desktop or any MCP-compatible client to gain **78 specialized tools** for your notes.
 
 - **Zero Coding Required**: Install the binary and point it at your vault.
-- **74 Specialized Tools**: Searching, link analysis, atomic Git-backed writes, SQL frontmatter queries, health checks, and more.
+- **78 Specialized Tools**: Searching, optional dense/hybrid RAG, link analysis, atomic Git-backed writes, SQL frontmatter queries, health checks, and more.
 - **Multi-Vault Support**: Switch between personal and work notes seamlessly at runtime.
 
 ---
@@ -41,7 +41,7 @@ TurboVault is a modular system composed of specialized crates. You can depend on
 | **[turbovault-parser](crates/turbovault-parser)** | High-speed .md & .ofm parser | [![Docs.rs](https://docs.rs/turbovault-parser/badge.svg)](https://docs.rs/turbovault-parser) |
 | **[turbovault-graph](crates/turbovault-graph)** | Link graph analysis & relationship discovery | [![Docs.rs](https://docs.rs/turbovault-graph/badge.svg)](https://docs.rs/turbovault-graph) |
 | **[turbovault-vault](crates/turbovault-vault)** | Vault management, file I/O & atomic writes | [![Docs.rs](https://docs.rs/turbovault-vault/badge.svg)](https://docs.rs/turbovault-vault) |
-| **[turbovault-tools](crates/turbovault-tools)** | 74 MCP tool implementations | [![Docs.rs](https://docs.rs/turbovault-tools/badge.svg)](https://docs.rs/turbovault-tools) |
+| **[turbovault-tools](crates/turbovault-tools)** | 78 MCP tool implementations | [![Docs.rs](https://docs.rs/turbovault-tools/badge.svg)](https://docs.rs/turbovault-tools) |
 | **[turbovault-plugin-api](crates/turbovault-plugin-api)** | Stable facade, provider contract & bounded hooks for compiled-in plugins | [![Docs.rs](https://docs.rs/turbovault-plugin-api/badge.svg)](https://docs.rs/turbovault-plugin-api) |
 | **[turbovault-sql](crates/turbovault-sql)** | SQL frontmatter queries (GlueSQL) | [![Docs.rs](https://docs.rs/turbovault-sql/badge.svg)](https://docs.rs/turbovault-sql) |
 | **[turbovault-batch](crates/turbovault-batch)** | Validated fail-fast operation batches | [![Docs.rs](https://docs.rs/turbovault-batch/badge.svg)](https://docs.rs/turbovault-batch) |
@@ -53,6 +53,7 @@ TurboVault is a modular system composed of specialized crates. You can depend on
 Unlike basic note readers, TurboVault understands your vault's **knowledge structure**:
 
 - **Full-text search** across all notes with BM25 ranking
+- **Optional dense and hybrid RAG** using heading-aware chunks and an OpenAI-compatible embedding endpoint
 - **Link graph analysis** to discover relationships, hubs, orphans, and cycles
 - **Vault intelligence** with health scoring and automated recommendations
 - **Validated operation batches** for fewer round trips and fail-fast execution
@@ -97,7 +98,7 @@ cargo install turbovault --features sql
 **From source:**
 
 ```bash
-git clone https://github.com/epistates/turbovault.git
+git clone https://github.com/samuelueluel/turbovault.git
 cd turbovault
 make release
 # Binary: ./target/release/turbovault
@@ -155,6 +156,19 @@ Claude: [Uses search() across the indexed vault]
 You: "What are my most important notes?"
 Claude: [Uses get_hub_notes() to find key concepts]
 ```
+
+### Optional Dense and Hybrid RAG
+
+TurboVault keeps exact sparse search as the default and adds dense retrieval as an opt-in derived index. Configure an OpenAI-compatible embedding endpoint, normally the local Qwen3 service used by Samuel's Zotero MCP fork:
+
+```bash
+export TURBOVAULT_EMBEDDING_ENDPOINT=http://127.0.0.1:8082/v1/embeddings
+export TURBOVAULT_EMBEDDING_MODEL=Qwen/Qwen3-Embedding-8B-GGUF
+# Optional: only needed for an authenticated endpoint
+export TURBOVAULT_EMBEDDING_API_KEY=...
+```
+
+The index is stored outside the vault and is versioned by vault path, model, and chunker. After connecting an MCP client, run `embedding_index_status()`, then `reindex_embeddings()`. Use `embedding_search()` for conceptual retrieval and `hybrid_search()` for the normal RAG route combining sparse exact matches with dense paraphrase matches. Vault mutations mark the derived index stale; regular `search()` continues to work while the dense index is rebuilt.
 
 ### Atomic Git-Backed Writes
 
@@ -536,7 +550,7 @@ TurboVault fully understands Obsidian's syntax:
 ## Building from Source
 
 ```bash
-git clone https://github.com/epistates/turbovault.git
+git clone https://github.com/samuelueluel/turbovault.git
 cd turbovault
 
 # Development build
@@ -656,8 +670,8 @@ MIT License - See [LICENSE](LICENSE) for details
 
 ## Links
 
-- **Repository**: https://github.com/epistates/turbovault
-- **Issues**: https://github.com/epistates/turbovault/issues
+- **Repository**: https://github.com/samuelueluel/turbovault
+- **Issues**: https://github.com/samuelueluel/turbovault/issues
 - **MCP Protocol**: https://modelcontextprotocol.io
 - **Obsidian**: https://obsidian.md
 - **Related**: [TurboMCP](https://github.com/epistates/turbomcp)

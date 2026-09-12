@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Optional dense and hybrid vault retrieval**: heading-aware Markdown chunks can be embedded through an OpenAI-compatible endpoint and persisted outside the vault. New `embedding_search`, `hybrid_search`, `reindex_embeddings`, and `embedding_index_status` tools add paraphrase-aware RAG without changing the existing sparse search, TF-IDF similarity, filters, graph, SQL, or mutation tools.
+- **Stale-index protection**: vault mutations mark the derived embedding index stale and dense tools fail closed until an explicit `reindex_embeddings` rebuild.
+
 ### Fixed
 
 - **Images and links inside a blockquote keep their destinations** ([#68](https://github.com/Epistates/turbovault/issues/68)): a quote is rebuilt from its raw text and re-parsed, and that pass only ever saw an image's alt or a link's label, so `> ![a](a.png)` came back as the bare text `a`. Every destination inside a quote was lost, while inline code round-tripped fine because it was already re-emitted with its delimiters. Images and links now are too, titles and spaced destinations included.
