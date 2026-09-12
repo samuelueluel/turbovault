@@ -1264,7 +1264,7 @@ mod tests {
             .expect("select vault");
 
         let advertised = server.list_tools();
-        assert_eq!(advertised.len(), 75);
+        assert_eq!(advertised.len(), 79);
         assert!(
             advertised
                 .iter()
