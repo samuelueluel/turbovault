@@ -1,5 +1,6 @@
 name: Cross-Platform Release
 
+# The fork keeps this workflow on the samuel default branch; upstream main remains untouched.
 on:
   push:
     tags:
