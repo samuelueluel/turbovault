@@ -171,6 +171,7 @@ pub mod audit_tools;
 pub mod batch_tools;
 pub mod diff_tools;
 pub mod duplicate_tools;
+pub mod embedding_engine;
 pub mod export_tools;
 pub mod file_tools;
 pub mod graph_tools;
@@ -198,6 +199,9 @@ pub use audit_tools::AuditTools;
 pub use batch_tools::BatchTools;
 pub use diff_tools::{DiffResult, DiffSummary, DiffTools};
 pub use duplicate_tools::{CompareResult, DuplicateGroup, DuplicateTools};
+pub use embedding_engine::{
+    EmbeddingEngine, EmbeddingIndexStatus, EmbeddingSearchResult, HybridSearchResult,
+};
 pub use export_tools::ExportTools;
 pub use file_tools::{
     FileTools, NoteInfo, SectionSlice, SliceResult, SliceSpec, WriteMode, obsidian_uri,

@@ -97,7 +97,7 @@ git2 = { workspace = true }
 # init + parallel ObsidianMcpServer setup is flaky (~25% failure rate
 # on a hot machine when tests run in parallel; isolating them removes
 # the flake entirely).
-serial_test = "4"
+serial_test = "3.2.0"
 # turbovault-3i5: wire-level MCP e2e — spawn the real `turbovault` binary
 # over stdio and drive it with the first-party turbomcp client, exercising
 # the JSON-RPC layer the in-process 6fo.18 suite skips and asserting derived

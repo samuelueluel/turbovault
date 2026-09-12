@@ -29,6 +29,7 @@ turbomcp = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+bincode = { workspace = true }
 yaml_serde = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
@@ -47,6 +48,8 @@ regex = { workspace = true }
 
 # Tier 1d: Production-grade full-text search
 tantivy = { workspace = true }
+reqwest = { workspace = true }
+sha2 = { workspace = true }
 
 # Optional: SQL query engine for frontmatter queries
 turbovault-sql = { workspace = true, optional = true }

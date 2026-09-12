@@ -14,10 +14,10 @@ use turbovault_core::events::{VaultChange, VaultEventSink, WriteAttribution};
 use turbovault_core::prelude::MultiVaultManager;
 use turbovault_tools::{
     AnalysisTools, AuditTools, BatchOperation, BatchTools, CommitLocks, DiffTools, DuplicateTools,
-    ExportTools, FanoutInfo, FileTools, GitMergeStrategy, GraphTools, GroundingTools,
-    MetadataTools, OkfTools, QualityTools, RelationshipTools, SearchEngine, SearchQuery,
-    SearchTools, SimilarityEngine, SliceResult, SliceSpec, TemplateEngine, VaultLifecycleTools,
-    VaultRepo, ViewerTools, WriteMode, obsidian_uri, slice_content,
+    EmbeddingEngine, ExportTools, FanoutInfo, FileTools, GitMergeStrategy, GraphTools,
+    GroundingTools, MetadataTools, OkfTools, QualityTools, RelationshipTools, SearchEngine,
+    SearchQuery, SearchTools, SimilarityEngine, SliceResult, SliceSpec, TemplateEngine,
+    VaultLifecycleTools, VaultRepo, ViewerTools, WriteMode, obsidian_uri, slice_content,
 };
 use turbovault_vault::{ChangeListener, CommitOrigin, VaultManager};
 
@@ -303,6 +303,8 @@ pub(super) struct CoreToolHandler {
     multi_vault_mgr: Arc<MultiVaultManager>,
     /// Cache of vault managers by vault name to persist state across calls
     vault_managers: Arc<RwLock<HashMap<String, Arc<VaultManager>>>>,
+    /// Cached dense/hybrid embedding engines by vault name.
+    embedding_engines: Arc<RwLock<HashMap<String, Arc<EmbeddingEngine>>>>,
     /// Cache for persisting vault state across server restarts (project-aware)
     persistent_cache: Arc<RwLock<Option<turbovault_core::cache::VaultCache>>>,
     /// Audit logs per vault (keyed by vault name)
@@ -365,6 +367,7 @@ impl CoreToolHandler {
         Ok(Self {
             multi_vault_mgr: Arc::new(mgr),
             vault_managers: Arc::new(RwLock::new(HashMap::new())),
+            embedding_engines: Arc::new(RwLock::new(HashMap::new())),
             persistent_cache: Arc::new(RwLock::new(None)),
             audit_logs: Arc::new(RwLock::new(HashMap::new())),
             snapshot_stores: Arc::new(RwLock::new(HashMap::new())),
@@ -751,13 +754,14 @@ impl CoreToolHandler {
         // manager only invokes this callback (R2 dependency inversion).
         let search_engines = Arc::clone(&self.search_engines);
         let similarity_engines = Arc::clone(&self.similarity_engines);
+        let embedding_engines = Arc::clone(&self.embedding_engines);
         // The sink holds only the hook bus, never a manager, so capturing it
         // does not reintroduce the reference cycle the maps above avoid.
         #[cfg(feature = "plugin-api")]
         let event_sink = Arc::clone(&self.event_sink);
         let name = vault_name.to_string();
-        let listener: ChangeListener =
-            Arc::new(move |changed: Vec<(String, bool, CommitOrigin)>| {
+        let listener: ChangeListener = Arc::new(
+            move |changed: Vec<(String, bool, CommitOrigin)>| {
                 // Announce the changes this process did not make. A local write was
                 // already reported at the write site, with the attribution only
                 // that site knows; reporting it again here would double-report
@@ -787,6 +791,7 @@ impl CoreToolHandler {
                     .collect();
                 let search_engines = Arc::clone(&search_engines);
                 let similarity_engines = Arc::clone(&similarity_engines);
+                let embedding_engines = Arc::clone(&embedding_engines);
                 let name = name.clone();
                 // Handed back rather than spawned: the manager awaits this
                 // before its freshness gate returns, so a caller that gated on
@@ -805,8 +810,17 @@ impl CoreToolHandler {
                         }
                     }
                     similarity_engines.write().await.remove(&name);
+                    let dense = { embedding_engines.read().await.get(&name).cloned() };
+                    if let Some(engine) = dense
+                        && let Err(error) = engine.mark_stale().await
+                    {
+                        log::warn!(
+                            "change-listener: marking embedding index stale failed for '{name}': {error}"
+                        );
+                    }
                 })
-            });
+            },
+        );
         manager.set_change_listener(listener);
 
         let is_git = self
@@ -939,6 +953,42 @@ impl CoreToolHandler {
         }
 
         Ok(engine)
+    }
+
+    /// Get or build the dense embedding engine for the active vault.
+    async fn get_embedding_engine(&self) -> McpResult<Arc<EmbeddingEngine>> {
+        let vault_name = self.get_active_vault_name().await?;
+        let manager = self.get_active_vault_manager().await?;
+        manager.ensure_fresh().await;
+
+        {
+            let cache = self.embedding_engines.read().await;
+            if let Some(engine) = cache.get(&vault_name) {
+                return Ok(engine.clone());
+            }
+        }
+
+        let engine = EmbeddingEngine::new(manager).await.map_err(|error| {
+            McpError::internal(format!("Failed to build embedding engine: {error}"))
+        })?;
+        let engine = Arc::new(engine);
+        let mut cache = self.embedding_engines.write().await;
+        if let Some(existing) = cache.get(&vault_name) {
+            return Ok(existing.clone());
+        }
+        cache.insert(vault_name, engine.clone());
+        Ok(engine)
+    }
+
+    /// Mark the dense index stale after a successful mutation. The marker is
+    /// persisted by the engine, so a restart cannot silently serve old vectors.
+    async fn invalidate_embedding_cache(&self, vault_name: &str) {
+        let engine = { self.embedding_engines.read().await.get(vault_name).cloned() };
+        if let Some(engine) = engine
+            && let Err(error) = engine.mark_stale().await
+        {
+            log::warn!("failed to mark embedding index stale for '{vault_name}': {error}");
+        }
     }
 
     /// Look up a registered vault's configuration by name.
@@ -1081,6 +1131,7 @@ impl CoreToolHandler {
     ) {
         self.invalidate_similarity_cache(vault_name).await;
         self.invalidate_search_cache(vault_name).await;
+        self.invalidate_embedding_cache(vault_name).await;
         let Some(sink) = self.event_sink.get() else {
             // No consumer configured; skip building envelopes nobody reads.
             return;
@@ -1193,6 +1244,7 @@ impl CoreToolHandler {
             .map_err(to_mcp_error)?;
         self.search_engines.write().await.remove(name);
         self.similarity_engines.write().await.remove(name);
+        self.embedding_engines.write().await.remove(name);
         self.vault_managers.write().await.remove(name);
         self.git_locks.write().await.remove(name);
 

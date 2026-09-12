@@ -503,6 +503,127 @@ impl AnalysisProvider {
     }
 
     #[tool(
+        description = "Find heading-aware note chunks using learned dense embeddings from the configured OpenAI-compatible local endpoint",
+        usage = "Use for conceptual or paraphrase-heavy retrieval where exact keyword search may miss the relevant note. Run reindex_embeddings first and inspect the returned path, heading, chunk text, and cosine score before reading source notes",
+        performance = "Moderate after indexing; query latency depends on the embedding endpoint",
+        related = ["hybrid_search", "reindex_embeddings", "embedding_index_status", "search"],
+        examples = ["embedding_search(query='mechanisms linking zoning restrictions to rent burdens')", "embedding_search(query='source-grounded RAG design', limit=20)"],
+        tags = ["read", "search", "semantic", "embeddings"],
+        read_only = true,
+    )]
+    async fn embedding_search(
+        &self,
+        query: String,
+        limit: Option<usize>,
+    ) -> McpResult<serde_json::Value> {
+        let start = std::time::Instant::now();
+        let vault_name = self.get_active_vault_name().await?;
+        let engine = self.get_embedding_engine().await?;
+        let results = engine
+            .search(&query, limit.unwrap_or(10).clamp(1, 100))
+            .await
+            .map_err(to_mcp_error)?;
+        let count = results.len();
+        StandardResponse::new(
+            &vault_name,
+            "embedding_search",
+            serde_json::to_value(&results)
+                .map_err(|error| McpError::internal(error.to_string()))?,
+        )
+        .with_count(count)
+        .with_duration(start.elapsed().as_millis() as u64)
+        .with_next_steps(&["read_note", "hybrid_search", "search"])
+        .to_json()
+    }
+
+    #[tool(
+        description = "Fuse sparse full-text retrieval with dense embedding retrieval using reciprocal-rank fusion",
+        usage = "Use as the default RAG discovery route for conceptual questions. It preserves exact technical matches while adding paraphrase recall, and returns the best source chunk plus sparse/dense component ranks",
+        performance = "Moderate after indexing; runs sparse search plus embedding endpoint query",
+        related = ["search", "embedding_search", "read_note", "advanced_search"],
+        examples = ["hybrid_search(query='how zoning restrictions affect housing rents')", "hybrid_search(query='difference-in-differences identification assumptions', limit=15)"],
+        tags = ["read", "search", "semantic", "embeddings"],
+        read_only = true,
+    )]
+    async fn hybrid_search(
+        &self,
+        query: String,
+        limit: Option<usize>,
+    ) -> McpResult<serde_json::Value> {
+        let start = std::time::Instant::now();
+        let (vault_name, manager) = self.get_vault_pair().await?;
+        let embedding_engine = self.get_embedding_engine().await?;
+        let sparse_engine = self.get_search_engine(&vault_name, &manager).await?;
+        let results = embedding_engine
+            .hybrid_search(&sparse_engine, &query, limit.unwrap_or(10).clamp(1, 100))
+            .await
+            .map_err(to_mcp_error)?;
+        let count = results.len();
+        StandardResponse::new(
+            &vault_name,
+            "hybrid_search",
+            serde_json::to_value(&results)
+                .map_err(|error| McpError::internal(error.to_string()))?,
+        )
+        .with_count(count)
+        .with_duration(start.elapsed().as_millis() as u64)
+        .with_next_steps(&["read_note", "get_backlinks", "advanced_search"])
+        .to_json()
+    }
+
+    #[tool(
+        description = "Build or rebuild the versioned dense embedding index for the active vault",
+        usage = "Run after configuring the local OpenAI-compatible embedding endpoint and after substantial vault changes. The index is stored outside the vault; writes to notes mark it stale and require another explicit reindex",
+        performance = "Slow on first build; processes heading-aware Markdown chunks in batches through the embedding endpoint",
+        related = ["embedding_index_status", "embedding_search", "hybrid_search"],
+        examples = ["reindex_embeddings()"],
+        tags = ["read", "search", "maintenance", "embeddings"],
+        read_only = true,
+    )]
+    async fn reindex_embeddings(&self) -> McpResult<serde_json::Value> {
+        let start = std::time::Instant::now();
+        let vault_name = self.get_active_vault_name().await?;
+        let engine = self.get_embedding_engine().await?;
+        let status = engine.reindex().await.map_err(to_mcp_error)?;
+        StandardResponse::new(
+            &vault_name,
+            "reindex_embeddings",
+            serde_json::to_value(status).map_err(|error| McpError::internal(error.to_string()))?,
+        )
+        .with_duration(start.elapsed().as_millis() as u64)
+        .with_next_steps(&[
+            "embedding_index_status",
+            "embedding_search",
+            "hybrid_search",
+        ])
+        .to_json()
+    }
+
+    #[tool(
+        description = "Report dense embedding index configuration, freshness, model, chunk count, and vector dimensions",
+        usage = "Use before dense or hybrid retrieval to confirm the configured endpoint is reachable through a completed index build and that the derived index is not stale",
+        performance = "Fast; reads in-memory index metadata",
+        related = ["reindex_embeddings", "embedding_search", "hybrid_search"],
+        examples = ["embedding_index_status()"],
+        tags = ["read", "search", "maintenance", "embeddings"],
+        read_only = true,
+    )]
+    async fn embedding_index_status(&self) -> McpResult<serde_json::Value> {
+        let start = std::time::Instant::now();
+        let vault_name = self.get_active_vault_name().await?;
+        let engine = self.get_embedding_engine().await?;
+        let status = engine.status().await;
+        StandardResponse::new(
+            &vault_name,
+            "embedding_index_status",
+            serde_json::to_value(status).map_err(|error| McpError::internal(error.to_string()))?,
+        )
+        .with_duration(start.elapsed().as_millis() as u64)
+        .with_next_steps(&["reindex_embeddings", "embedding_search", "hybrid_search"])
+        .to_json()
+    }
+
+    #[tool(
         description = "Find notes most similar in content to a specific note using TF-IDF cosine similarity",
         usage = "Use to discover related notes for linking, find candidates for merging, or identify thematic clusters. More content-aware than graph-based get_related_notes",
         performance = "Moderate (<500ms for 10k notes). Uses pre-built TF-IDF vectors",

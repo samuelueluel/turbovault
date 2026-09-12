@@ -2309,6 +2309,118 @@
       "tags": [
         "read",
         "search",
+        "semantic",
+        "embeddings"
+      ]
+    },
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "description": "Find heading-aware note chunks using learned dense embeddings from the configured OpenAI-compatible local endpoint",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "limit": {
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "query": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "type": "object"
+    },
+    "name": "embedding_search"
+  },
+  {
+    "_meta": {
+      "tags": [
+        "read",
+        "search",
+        "semantic",
+        "embeddings"
+      ]
+    },
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "description": "Fuse sparse full-text retrieval with dense embedding retrieval using reciprocal-rank fusion",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "limit": {
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "query": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "type": "object"
+    },
+    "name": "hybrid_search"
+  },
+  {
+    "_meta": {
+      "tags": [
+        "read",
+        "search",
+        "maintenance",
+        "embeddings"
+      ]
+    },
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "description": "Build or rebuild the versioned dense embedding index for the active vault",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "name": "reindex_embeddings"
+  },
+  {
+    "_meta": {
+      "tags": [
+        "read",
+        "search",
+        "maintenance",
+        "embeddings"
+      ]
+    },
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "description": "Report dense embedding index configuration, freshness, model, chunk count, and vector dimensions",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "name": "embedding_index_status"
+  },
+  {
+    "_meta": {
+      "tags": [
+        "read",
+        "search",
         "semantic"
       ]
     },
