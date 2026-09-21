@@ -345,17 +345,16 @@ impl EmbeddingEngine {
         let existing_chunks_by_path: HashMap<String, (String, Vec<EmbeddingChunk>)> = {
             let state = self.state.read().await;
             let mut map = HashMap::new();
-            if let Some(index) = state.as_ref() {
-                if index.schema_version == INDEX_SCHEMA_VERSION
-                    && index.chunker_version == CHUNKER_VERSION
-                    && index.model == self.config.model
-                {
-                    for chunk in &index.chunks {
-                        map.entry(chunk.path.clone())
-                            .or_insert_with(|| (chunk.content_hash.clone(), Vec::new()))
-                            .1
-                            .push(chunk.clone());
-                    }
+            if let Some(index) = state.as_ref()
+                && index.schema_version == INDEX_SCHEMA_VERSION
+                && index.chunker_version == CHUNKER_VERSION
+                && index.model == self.config.model
+            {
+                for chunk in &index.chunks {
+                    map.entry(chunk.path.clone())
+                        .or_insert_with(|| (chunk.content_hash.clone(), Vec::new()))
+                        .1
+                        .push(chunk.clone());
                 }
             }
             map
@@ -387,11 +386,12 @@ impl EmbeddingEngine {
             let content_hash = hex_hash(vault_file.content.as_bytes());
 
             // Reuse pre-existing chunks if content_hash has not changed
-            if let Some((cached_hash, cached_chunks)) = existing_chunks_by_path.get(&relative) {
-                if cached_hash == &content_hash && !cached_chunks.is_empty() {
-                    final_chunks.extend(cached_chunks.clone());
-                    continue;
-                }
+            if let Some((cached_hash, cached_chunks)) = existing_chunks_by_path.get(&relative)
+                && cached_hash == &content_hash
+                && !cached_chunks.is_empty()
+            {
+                final_chunks.extend(cached_chunks.clone());
+                continue;
             }
 
             let title = vault_file
@@ -589,10 +589,11 @@ impl EmbeddingEngine {
                 Vec::new()
             }
         };
-        if dense.is_empty() && sparse.is_empty() {
-            if let Some(error) = dense_error.or(sparse_error) {
-                return Err(error);
-            }
+        if dense.is_empty()
+            && sparse.is_empty()
+            && let Some(error) = dense_error.or(sparse_error)
+        {
+            return Err(error);
         }
 
         let mut fused: HashMap<String, HybridAccumulator> = HashMap::new();

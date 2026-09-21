@@ -48,7 +48,7 @@ pub struct ParseOptions {
     pub parse_headings: bool,
     /// Parse task items (`- [ ]` / `- [x]`)
     pub parse_tasks: bool,
-    /// Parse callout blocks (> [!NOTE])
+    /// Parse callout blocks (> \[!NOTE\])
     pub parse_callouts: bool,
     /// Parse inline tags (#tag)
     pub parse_tags: bool,
@@ -152,7 +152,7 @@ pub struct ParsedContent {
     pub tags: Vec<Tag>,
     /// Task items: `- [ ]`, `- [x]`
     pub tasks: Vec<TaskItem>,
-    /// Callout blocks: > [!NOTE]
+    /// Callout blocks: > \[!NOTE\]
     pub callouts: Vec<Callout>,
 }
 
