@@ -22,6 +22,7 @@
 //!   already covered lexically; refusing the dense half as well only removes
 //!   the meaning-matching capability without protecting anything.
 
+use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -31,7 +32,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use turbovault_core::prelude::*;
 use turbovault_parser::to_plain_text;
@@ -50,6 +51,17 @@ const DEFAULT_RERANKER_ENDPOINT: &str = "http://127.0.0.1:8083/v1/rerank";
 const DEFAULT_RERANKER_MODEL: &str = "BAAI/bge-reranker-v2-m3";
 const DEFAULT_RERANK_BATCH_SIZE: usize = 12;
 const RRF_K: f64 = 60.0;
+/// How far behind an index may fall before a search refreshes it in place.
+///
+/// Refreshing is an optimisation, not a correctness requirement: an out-of-date
+/// index is still served, so this only decides how stale the vectors are allowed
+/// to get before the engine spends embedding calls to catch up. Six hours keeps
+/// content current across a working session without re-embedding after every
+/// keystroke. Set `TURBOVAULT_EMBEDDING_REFRESH_AFTER_SECS=0` to disable.
+const DEFAULT_REFRESH_AFTER_SECS: u64 = 21_600;
+/// Minimum wait before retrying a failed lazy refresh, so a down endpoint is not
+/// re-attempted on every search.
+const REFRESH_RETRY_BACKOFF: Duration = Duration::from_secs(300);
 
 /// Runtime configuration for the external embedding endpoint and local reranker.
 #[derive(Debug, Clone)]
@@ -66,6 +78,8 @@ pub struct EmbeddingConfig {
     pub reranker_model: String,
     pub reranker_enabled: bool,
     pub reranker_batch_size: usize,
+    /// Refresh an out-of-date index when it is at least this old. Zero disables.
+    pub refresh_after: Duration,
 }
 
 impl EmbeddingConfig {
@@ -102,6 +116,11 @@ impl EmbeddingConfig {
         let reranker_batch_size =
             env_usize("TURBOVAULT_RERANKER_BATCH_SIZE", DEFAULT_RERANK_BATCH_SIZE)?;
 
+        let refresh_after = Duration::from_secs(env_usize(
+            "TURBOVAULT_EMBEDDING_REFRESH_AFTER_SECS",
+            DEFAULT_REFRESH_AFTER_SECS as usize,
+        )? as u64);
+
         let index_root = env::var_os("TURBOVAULT_EMBEDDING_INDEX_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(default_index_root);
@@ -122,6 +141,7 @@ impl EmbeddingConfig {
             reranker_model,
             reranker_enabled,
             reranker_batch_size,
+            refresh_after,
         })
     }
 }
@@ -266,6 +286,36 @@ struct EmbeddingItem {
     index: usize,
 }
 
+/// Whether an out-of-date index has fallen far enough behind to refresh now.
+///
+/// Split out as a pure function so the threshold policy is testable without an
+/// engine, an endpoint, or a vault. A fresh index is never due, regardless of
+/// age: nothing has changed, so there is nothing to catch up on.
+fn refresh_due(
+    stale: bool,
+    built_at: Option<&str>,
+    threshold: Duration,
+    now: DateTime<Utc>,
+) -> bool {
+    if threshold.is_zero() || !stale {
+        return false;
+    }
+    let Some(built_at) = built_at else {
+        return true;
+    };
+    match DateTime::parse_from_rfc3339(built_at) {
+        Ok(built) => now
+            .signed_duration_since(built.with_timezone(&Utc))
+            .to_std()
+            // A negative age means the clock moved backwards; do not thrash.
+            .map(|age| age >= threshold)
+            .unwrap_or(false),
+        // An unreadable timestamp is treated as due: the index is stale anyway,
+        // and one refresh is cheap next to never refreshing.
+        Err(_) => true,
+    }
+}
+
 /// Why a stored index cannot be used with the current configuration, if it
 /// cannot.
 ///
@@ -300,6 +350,10 @@ pub struct EmbeddingEngine {
     state: RwLock<Option<StoredIndex>>,
     stale: AtomicBool,
     incompatible: AtomicBool,
+    /// Serializes lazy refreshes so concurrent searches embed at most once.
+    refresh_guard: tokio::sync::Mutex<()>,
+    /// Last lazy-refresh attempt, so a failing endpoint backs off.
+    last_refresh_attempt: std::sync::Mutex<Option<Instant>>,
 }
 
 impl EmbeddingEngine {
@@ -347,6 +401,8 @@ impl EmbeddingEngine {
             state: RwLock::new(state),
             stale: AtomicBool::new(stale),
             incompatible: AtomicBool::new(incompatible),
+            refresh_guard: tokio::sync::Mutex::new(()),
+            last_refresh_attempt: std::sync::Mutex::new(None),
         })
     }
 
@@ -609,12 +665,68 @@ impl EmbeddingEngine {
             .collect())
     }
 
+    /// Bring an out-of-date index current before answering, if it has fallen
+    /// further behind than the configured threshold.
+    ///
+    /// Deliberately never fails the caller. The whole point of serving an
+    /// out-of-date index is that retrieval must not depend on reindexing
+    /// succeeding, so a refresh failure logs and the existing vectors are used.
+    ///
+    /// Never builds a missing index either: the initial build embeds the entire
+    /// vault and stays an explicit choice, while maintaining an existing index
+    /// costs only the notes that changed.
+    async fn refresh_if_due(&self) {
+        if self.config.refresh_after.is_zero() {
+            return;
+        }
+        let built_at = {
+            let state = self.state.read().await;
+            match state.as_ref() {
+                None => return,
+                Some(index) => index.built_at.clone(),
+            }
+        };
+        if !refresh_due(
+            self.stale.load(AtomicOrdering::Acquire),
+            Some(&built_at),
+            self.config.refresh_after,
+            Utc::now(),
+        ) {
+            return;
+        }
+        if let Ok(last) = self.last_refresh_attempt.lock()
+            && let Some(attempted) = *last
+            && attempted.elapsed() < REFRESH_RETRY_BACKOFF
+        {
+            return;
+        }
+        // Concurrent searches proceed with the vectors already loaded rather
+        // than queueing behind a refresh they did not ask for.
+        let Ok(_guard) = self.refresh_guard.try_lock() else {
+            return;
+        };
+        if let Ok(mut last) = self.last_refresh_attempt.lock() {
+            *last = Some(Instant::now());
+        }
+        log::info!(
+            "embedding index is out of date and older than {:?}; refreshing before search",
+            self.config.refresh_after
+        );
+        match self.reindex().await {
+            Ok(status) => log::info!("lazy index refresh complete: {} chunks", status.chunks),
+            Err(error) => {
+                log::warn!("lazy index refresh failed; serving the existing index: {error}")
+            }
+        }
+    }
+
     pub async fn hybrid_search(
         &self,
         search_engine: &SearchEngine,
         query: &str,
         limit: usize,
     ) -> Result<Vec<HybridSearchResult>> {
+        self.refresh_if_due().await;
         let candidate_limit = limit.saturating_mul(5).clamp(20, 100);
         // Both retrieval channels degrade independently: a dead embedding sidecar
         // must not take out lexical search, and an unparseable lexical query must
@@ -1146,6 +1258,50 @@ mod tests {
         let mut rechunked = stored_index("Qwen/Qwen3-Embedding-8B-GGUF", vault);
         rechunked.chunker_version = "markdown-heading-v2".to_string();
         assert!(index_mismatch(&rechunked, "Qwen/Qwen3-Embedding-8B-GGUF", vault).is_some());
+    }
+
+    fn at(offset_hours: i64) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-09-21T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+            + chrono::Duration::hours(offset_hours)
+    }
+
+    /// The lazy-refresh threshold: an out-of-date index is refreshed only once it
+    /// has fallen far enough behind. Refreshing is an optimisation, so the
+    /// policy has to be conservative in both directions — never embed on every
+    /// search, but never let the vectors drift indefinitely either.
+    #[test]
+    fn refresh_is_due_only_when_stale_and_past_the_threshold() {
+        let threshold = Duration::from_secs(6 * 3600);
+        let now = at(0);
+        let built = |hours_ago: i64| at(-hours_ago).to_rfc3339();
+
+        // A fresh index is never due, however old: nothing changed.
+        assert!(!refresh_due(false, Some(&built(48)), threshold, now));
+
+        // Stale but recent: too soon to spend embedding calls.
+        assert!(!refresh_due(true, Some(&built(1)), threshold, now));
+        assert!(!refresh_due(true, Some(&built(5)), threshold, now));
+
+        // Stale and past the threshold.
+        assert!(refresh_due(true, Some(&built(7)), threshold, now));
+        assert!(refresh_due(true, Some(&built(100)), threshold, now));
+
+        // Zero disables the feature entirely.
+        assert!(!refresh_due(true, Some(&built(100)), Duration::ZERO, now));
+
+        // A missing or unreadable timestamp on a stale index counts as due.
+        assert!(refresh_due(true, None, threshold, now));
+        assert!(refresh_due(true, Some("not a timestamp"), threshold, now));
+
+        // A clock that moved backwards must not trigger repeated refreshes.
+        assert!(!refresh_due(
+            true,
+            Some(&at(5).to_rfc3339()),
+            threshold,
+            now
+        ));
     }
 
     #[test]
