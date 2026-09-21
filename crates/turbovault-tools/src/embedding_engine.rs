@@ -6,9 +6,21 @@
 //! vector index, and combines dense results with TurboVault's sparse search.
 //!
 //! The index is not stored in the vault. It is derived state keyed by the
-//! vault path, embedding model, and chunker version. Vault writes mark the
-//! index stale; callers must explicitly run `reindex_embeddings` before using
-//! dense retrieval again.
+//! vault path, embedding model, and chunker version.
+//!
+//! Two conditions are tracked separately because only one of them is a
+//! correctness problem:
+//!
+//! - *Incompatible*: the stored index was built against a different model,
+//!   schema, chunker, or vault path. Its vectors live in a different space, so
+//!   cosine similarity against a fresh query vector is meaningless. Dense
+//!   search refuses until `reindex_embeddings` runs.
+//! - *Stale*: the vault was written to since the index was built. The vectors
+//!   are merely out of date and are still served, because they remain in the
+//!   same space and rank correctly. The sparse channel is updated eagerly on
+//!   every mutation, so anything created or edited since the last reindex is
+//!   already covered lexically; refusing the dense half as well only removes
+//!   the meaning-matching capability without protecting anything.
 
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -203,7 +215,10 @@ pub struct EmbeddingIndexStatus {
     pub model: String,
     pub api_key_configured: bool,
     pub index_path: String,
+    /// The vault changed since the index was built. Served anyway.
     pub stale: bool,
+    /// The index cannot be used at all; run `reindex_embeddings`.
+    pub incompatible: bool,
     pub exists: bool,
     pub chunks: usize,
     pub dimensions: usize,
@@ -251,6 +266,30 @@ struct EmbeddingItem {
     index: usize,
 }
 
+/// Why a stored index cannot be used with the current configuration, if it
+/// cannot.
+///
+/// Deliberately silent about freshness. An index built from an older snapshot
+/// of the same vault is usable: its vectors were produced by the same model and
+/// chunker, so they live in the same space as a fresh query vector and rank
+/// correctly. Only a change of model, schema, chunker, or vault path makes the
+/// stored vectors incomparable, which is the sole case that must fail closed.
+fn index_mismatch(index: &StoredIndex, model: &str, vault_path: &str) -> Option<&'static str> {
+    if index.schema_version != INDEX_SCHEMA_VERSION {
+        return Some("index schema version differs from this build");
+    }
+    if index.chunker_version != CHUNKER_VERSION {
+        return Some("index chunker version differs from this build");
+    }
+    if index.model != model {
+        return Some("index was built with a different embedding model");
+    }
+    if index.vault_path != vault_path {
+        return Some("index was built for a different vault path");
+    }
+    None
+}
+
 /// Cached dense index and its endpoint client.
 pub struct EmbeddingEngine {
     manager: Arc<VaultManager>,
@@ -260,6 +299,7 @@ pub struct EmbeddingEngine {
     stale_path: PathBuf,
     state: RwLock<Option<StoredIndex>>,
     stale: AtomicBool,
+    incompatible: AtomicBool,
 }
 
 impl EmbeddingEngine {
@@ -268,7 +308,8 @@ impl EmbeddingEngine {
         tokio::fs::create_dir_all(&config.index_dir).await?;
         let index_path = config.index_dir.join("index.bin");
         let stale_path = config.index_dir.join("index.stale");
-        let mut stale = tokio::fs::try_exists(&stale_path).await.unwrap_or(false);
+        let stale = tokio::fs::try_exists(&stale_path).await.unwrap_or(false);
+        let mut incompatible = false;
         let state = if tokio::fs::try_exists(&index_path).await.unwrap_or(false) {
             let bytes = tokio::fs::read(&index_path).await.map_err(|error| {
                 Error::other(format!("failed to read embedding index: {error}"))
@@ -279,13 +320,12 @@ impl EmbeddingEngine {
                     index_path.display()
                 ))
             })?;
-            if parsed.schema_version != INDEX_SCHEMA_VERSION
-                || parsed.chunker_version != CHUNKER_VERSION
-                || parsed.model != config.model
-                || parsed.vault_path != manager.vault_path().to_string_lossy()
-            {
-                stale = true;
-            }
+            incompatible = index_mismatch(
+                &parsed,
+                &config.model,
+                &manager.vault_path().to_string_lossy(),
+            )
+            .is_some();
             Some(parsed)
         } else {
             None
@@ -306,6 +346,7 @@ impl EmbeddingEngine {
             stale_path,
             state: RwLock::new(state),
             stale: AtomicBool::new(stale),
+            incompatible: AtomicBool::new(incompatible),
         })
     }
 
@@ -318,6 +359,7 @@ impl EmbeddingEngine {
             api_key_configured: self.config.api_key_configured,
             index_path: self.index_path.display().to_string(),
             stale: self.stale.load(AtomicOrdering::Acquire),
+            incompatible: self.incompatible.load(AtomicOrdering::Acquire),
             exists: state.is_some(),
             chunks: state.as_ref().map(|index| index.chunks.len()).unwrap_or(0),
             dimensions: state.as_ref().map(|index| index.dimension).unwrap_or(0),
@@ -330,8 +372,11 @@ impl EmbeddingEngine {
         }
     }
 
-    /// Mark derived vectors unusable after any vault mutation. The marker is
-    /// persisted so a process restart cannot accidentally serve stale vectors.
+    /// Record that the vault changed after the index was built.
+    ///
+    /// The marker is persisted so a restart still knows the vectors are out of
+    /// date. It no longer blocks retrieval: an out-of-date index is served, and
+    /// the flag exists so `embedding_index_status` can report freshness.
     pub async fn mark_stale(&self) -> Result<()> {
         self.stale.store(true, AtomicOrdering::Release);
         tokio::fs::write(&self.stale_path, b"stale\n").await?;
@@ -500,13 +545,21 @@ impl EmbeddingEngine {
         let _ = tokio::fs::remove_file(&self.stale_path).await;
         *self.state.write().await = Some(index);
         self.stale.store(false, AtomicOrdering::Release);
+        // The index just written necessarily matches the current configuration.
+        self.incompatible.store(false, AtomicOrdering::Release);
         Ok(self.status().await)
     }
 
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<EmbeddingSearchResult>> {
-        if self.stale.load(AtomicOrdering::Acquire) {
+        // Refuse only when the stored vectors are not comparable to a query
+        // vector. An out-of-date index is deliberately served: it ranks
+        // correctly, and the sparse channel already covers everything created
+        // or edited since the last reindex.
+        if self.incompatible.load(AtomicOrdering::Acquire) {
             return Err(Error::config_error(
-                "embedding index is stale; run reindex_embeddings before dense search",
+                "embedding index was built with a different model, schema, chunker, or vault \
+                 path, so its vectors are not comparable to a query vector. Run \
+                 reindex_embeddings",
             ));
         }
         let query = query.trim();
@@ -1048,6 +1101,51 @@ mod tests {
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].heading.as_deref(), Some("One"));
         assert_eq!(chunks[1].heading.as_deref(), Some("Two"));
+    }
+
+    fn stored_index(model: &str, vault_path: &str) -> StoredIndex {
+        StoredIndex {
+            schema_version: INDEX_SCHEMA_VERSION,
+            chunker_version: CHUNKER_VERSION.to_string(),
+            model: model.to_string(),
+            vault_path: vault_path.to_string(),
+            dimension: 4096,
+            built_at: "2026-01-01T00:00:00Z".to_string(),
+            chunks: Vec::new(),
+        }
+    }
+
+    /// Regression: a vault write marks the index stale, and that used to make
+    /// `search` refuse outright. A stale index is built by the same model and
+    /// chunker, so its vectors are still comparable to a query vector. Only a
+    /// configuration change makes the index unusable.
+    #[test]
+    fn stale_index_is_usable_and_only_config_changes_are_incompatible() {
+        let vault = "/home/samuel/vault";
+        let index = stored_index("Qwen/Qwen3-Embedding-8B-GGUF", vault);
+
+        // The index carries no freshness field at all, so there is nothing for
+        // a vault write to invalidate here. This is the property that makes
+        // `search` serve an out-of-date index rather than refusing it.
+        assert_eq!(
+            index_mismatch(&index, "Qwen/Qwen3-Embedding-8B-GGUF", vault),
+            None
+        );
+
+        // A different embedding model produces vectors in a different space.
+        assert!(
+            index_mismatch(&index, "BAAI/bge-m3", vault).is_some(),
+            "a model change must refuse: cosine similarity across spaces is meaningless"
+        );
+        assert!(index_mismatch(&index, "Qwen/Qwen3-Embedding-8B-GGUF", "/other/vault").is_some());
+
+        let mut reschemaed = stored_index("Qwen/Qwen3-Embedding-8B-GGUF", vault);
+        reschemaed.schema_version = INDEX_SCHEMA_VERSION + 1;
+        assert!(index_mismatch(&reschemaed, "Qwen/Qwen3-Embedding-8B-GGUF", vault).is_some());
+
+        let mut rechunked = stored_index("Qwen/Qwen3-Embedding-8B-GGUF", vault);
+        rechunked.chunker_version = "markdown-heading-v2".to_string();
+        assert!(index_mismatch(&rechunked, "Qwen/Qwen3-Embedding-8B-GGUF", vault).is_some());
     }
 
     #[test]
