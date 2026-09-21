@@ -490,21 +490,51 @@ impl AnalysisProvider {
         let (vault_name, manager) = self.get_vault_pair().await?;
         let embedding_engine = self.get_embedding_engine().await?;
         let sparse_engine = self.get_search_engine(&vault_name, &manager).await?;
-        let results = embedding_engine
+        let outcome = embedding_engine
             .hybrid_search(&sparse_engine, &query, limit.unwrap_or(10).clamp(1, 100))
             .await
             .map_err(to_mcp_error)?;
-        let count = results.len();
-        StandardResponse::new(
+        let count = outcome.results.len();
+        let diagnostics = &outcome.diagnostics;
+        let mut response = StandardResponse::new(
             &vault_name,
             "semantic_search",
-            serde_json::to_value(&results)
+            serde_json::to_value(&outcome.results)
                 .map_err(|error| McpError::internal(error.to_string()))?,
         )
         .with_count(count)
         .with_duration(start.elapsed().as_millis() as u64)
-        .with_next_steps(&["read_note", "get_backlinks", "advanced_search"])
-        .to_json()
+        .with_next_steps(&["read_note", "get_backlinks", "advanced_search"]);
+
+        // Surface every degradation as a sentence the caller can relay verbatim.
+        // Without this the only evidence is a null score on each row, which is
+        // how a sparse-only fallback silently passed for a real result earlier.
+        if let Some(reason) = &diagnostics.dense_unavailable {
+            response = response.with_warning(format!(
+                "Dense (meaning-based) retrieval was unavailable, so these are lexical keyword results only and will miss paraphrases: {reason}"
+            ));
+        }
+        if let Some(reason) = &diagnostics.sparse_unavailable {
+            response = response.with_warning(format!(
+                "Lexical (keyword) retrieval was unavailable, so these are meaning-based results only and will miss exact terms, identifiers, and filenames: {reason}"
+            ));
+        }
+        if let Some(reason) = &diagnostics.rerank_unavailable {
+            response = response.with_warning(format!(
+                "Cross-encoder reranking was unavailable, so results keep fused rank order: {reason}"
+            ));
+        }
+        if let Some(reason) = &diagnostics.refresh_failed {
+            response = response.with_warning(format!(
+                "The embedding index is out of date and could not be refreshed, so results may omit recent edits: {reason}"
+            ));
+        }
+        response = response.with_meta(
+            "retrieval",
+            serde_json::to_value(diagnostics)
+                .map_err(|error| McpError::internal(error.to_string()))?,
+        );
+        response.to_json()
     }
 
     #[tool(

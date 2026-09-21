@@ -340,6 +340,56 @@ fn index_mismatch(index: &StoredIndex, model: &str, vault_path: &str) -> Option<
     None
 }
 
+/// Which retrieval channels contributed to a hybrid result, and why any did not.
+///
+/// Exists so a degraded search is never mistaken for a healthy one. The only
+/// other evidence is `dense_score: null` on every row, which is easy to overlook
+/// and impossible to explain after the fact, because the reason lived in a log
+/// line the caller never saw.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct HybridDiagnostics {
+    /// Reason the dense channel contributed nothing, if it did not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dense_unavailable: Option<String>,
+    /// Reason the sparse channel contributed nothing, if it did not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sparse_unavailable: Option<String>,
+    /// Reason cross-encoder reranking was skipped, if it was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rerank_unavailable: Option<String>,
+    /// The vault had been written to since the index was built.
+    pub index_stale: bool,
+    /// A refresh ran before this search because the index was past the threshold.
+    pub index_refreshed: bool,
+    /// The refresh was due but failed; the previous index was served instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh_failed: Option<String>,
+}
+
+impl HybridDiagnostics {
+    /// Whether every channel contributed, so a caller can stay silent.
+    pub fn is_complete(&self) -> bool {
+        self.dense_unavailable.is_none()
+            && self.sparse_unavailable.is_none()
+            && self.rerank_unavailable.is_none()
+            && self.refresh_failed.is_none()
+    }
+}
+
+/// Hybrid retrieval results together with the channel status that produced them.
+#[derive(Debug, Clone, Serialize)]
+pub struct HybridSearchOutcome {
+    pub results: Vec<HybridSearchResult>,
+    pub diagnostics: HybridDiagnostics,
+}
+
+/// What a lazy refresh did, so the caller can report it.
+#[derive(Debug, Default)]
+struct RefreshReport {
+    refreshed: bool,
+    failure: Option<String>,
+}
+
 /// Cached dense index and its endpoint client.
 pub struct EmbeddingEngine {
     manager: Arc<VaultManager>,
@@ -675,14 +725,14 @@ impl EmbeddingEngine {
     /// Never builds a missing index either: the initial build embeds the entire
     /// vault and stays an explicit choice, while maintaining an existing index
     /// costs only the notes that changed.
-    async fn refresh_if_due(&self) {
+    async fn refresh_if_due(&self) -> RefreshReport {
         if self.config.refresh_after.is_zero() {
-            return;
+            return RefreshReport::default();
         }
         let built_at = {
             let state = self.state.read().await;
             match state.as_ref() {
-                None => return,
+                None => return RefreshReport::default(),
                 Some(index) => index.built_at.clone(),
             }
         };
@@ -692,18 +742,18 @@ impl EmbeddingEngine {
             self.config.refresh_after,
             Utc::now(),
         ) {
-            return;
+            return RefreshReport::default();
         }
         if let Ok(last) = self.last_refresh_attempt.lock()
             && let Some(attempted) = *last
             && attempted.elapsed() < REFRESH_RETRY_BACKOFF
         {
-            return;
+            return RefreshReport::default();
         }
         // Concurrent searches proceed with the vectors already loaded rather
         // than queueing behind a refresh they did not ask for.
         let Ok(_guard) = self.refresh_guard.try_lock() else {
-            return;
+            return RefreshReport::default();
         };
         if let Ok(mut last) = self.last_refresh_attempt.lock() {
             *last = Some(Instant::now());
@@ -713,20 +763,35 @@ impl EmbeddingEngine {
             self.config.refresh_after
         );
         match self.reindex().await {
-            Ok(status) => log::info!("lazy index refresh complete: {} chunks", status.chunks),
+            Ok(status) => {
+                log::info!("lazy index refresh complete: {} chunks", status.chunks);
+                RefreshReport {
+                    refreshed: true,
+                    failure: None,
+                }
+            }
             Err(error) => {
-                log::warn!("lazy index refresh failed; serving the existing index: {error}")
+                log::warn!("lazy index refresh failed; serving the existing index: {error}");
+                RefreshReport {
+                    refreshed: false,
+                    failure: Some(error.to_string()),
+                }
             }
         }
     }
 
+    /// Hybrid retrieval: fused dense and sparse candidates, optionally reranked.
+    ///
+    /// Returns the channel diagnostics alongside the results, so a caller can
+    /// report *why* a search was degraded rather than only that it was.
     pub async fn hybrid_search(
         &self,
         search_engine: &SearchEngine,
         query: &str,
         limit: usize,
-    ) -> Result<Vec<HybridSearchResult>> {
-        self.refresh_if_due().await;
+    ) -> Result<HybridSearchOutcome> {
+        let refresh = self.refresh_if_due().await;
+        let index_stale = self.stale.load(AtomicOrdering::Acquire);
         let candidate_limit = limit.saturating_mul(5).clamp(20, 100);
         // Both retrieval channels degrade independently: a dead embedding sidecar
         // must not take out lexical search, and an unparseable lexical query must
@@ -754,6 +819,10 @@ impl EmbeddingEngine {
                 Vec::new()
             }
         };
+        // Captured before the errors are consumed below, so the diagnostics can
+        // name the cause even when a channel is empty for a benign reason.
+        let dense_reason = dense_error.as_ref().map(|error| error.to_string());
+        let sparse_reason = sparse_error.as_ref().map(|error| error.to_string());
         if dense.is_empty()
             && sparse.is_empty()
             && let Some(error) = dense_error.or(sparse_error)
@@ -820,6 +889,7 @@ impl EmbeddingEngine {
         });
 
         // Second-stage cross-encoder rerank if enabled and endpoint is configured
+        let mut rerank_error: Option<Error> = None;
         if self.config.reranker_enabled
             && !self.config.reranker_endpoint.trim().is_empty()
             && !results.is_empty()
@@ -844,6 +914,7 @@ impl EmbeddingEngine {
                     log::warn!(
                         "reranker unavailable in hybrid retrieval, keeping RRF order: {error}"
                     );
+                    rerank_error = Some(error);
                     Vec::new()
                 }
             };
@@ -864,7 +935,17 @@ impl EmbeddingEngine {
         }
 
         results.truncate(limit);
-        Ok(results.into_iter().map(HybridAccumulator::finish).collect())
+        Ok(HybridSearchOutcome {
+            results: results.into_iter().map(HybridAccumulator::finish).collect(),
+            diagnostics: HybridDiagnostics {
+                dense_unavailable: dense_reason,
+                sparse_unavailable: sparse_reason,
+                rerank_unavailable: rerank_error.map(|error| error.to_string()),
+                index_stale,
+                index_refreshed: refresh.refreshed,
+                refresh_failed: refresh.failure,
+            },
+        })
     }
 
     pub async fn rerank(&self, query: &str, documents: &[String]) -> Result<Vec<(usize, f64)>> {
@@ -1302,6 +1383,33 @@ mod tests {
             threshold,
             now
         ));
+    }
+
+    /// Diagnostics must add nothing to a healthy response. A search where every
+    /// channel contributed should be indistinguishable from before this existed,
+    /// so the reporting cannot become context bloat on the common path.
+    #[test]
+    fn diagnostics_serialize_nothing_when_every_channel_contributed() {
+        let healthy = HybridDiagnostics::default();
+        assert!(healthy.is_complete());
+        assert_eq!(
+            serde_json::to_value(&healthy).unwrap(),
+            serde_json::json!({"index_stale": false, "index_refreshed": false}),
+            "absent reasons must not serialize as nulls"
+        );
+
+        let degraded = HybridDiagnostics {
+            dense_unavailable: Some("embedding endpoint unreachable".to_string()),
+            index_stale: true,
+            ..Default::default()
+        };
+        assert!(!degraded.is_complete());
+        let json = serde_json::to_value(&degraded).unwrap();
+        assert_eq!(json["dense_unavailable"], "embedding endpoint unreachable");
+        assert_eq!(json["index_stale"], true);
+        // Reasons that did not occur stay absent rather than becoming null.
+        assert!(json.get("rerank_unavailable").is_none());
+        assert!(json.get("refresh_failed").is_none());
     }
 
     #[test]
