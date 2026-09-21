@@ -675,7 +675,9 @@ impl EmbeddingEngine {
             let reranked = match self.rerank(query, &documents).await {
                 Ok(results) => results,
                 Err(error) => {
-                    log::warn!("reranker unavailable in hybrid retrieval, keeping RRF order: {error}");
+                    log::warn!(
+                        "reranker unavailable in hybrid retrieval, keeping RRF order: {error}"
+                    );
                     Vec::new()
                 }
             };
@@ -717,7 +719,10 @@ impl EmbeddingEngine {
                 query,
                 documents: chunk,
             };
-            let mut builder = self.client.post(&self.config.reranker_endpoint).json(&request);
+            let mut builder = self
+                .client
+                .post(&self.config.reranker_endpoint)
+                .json(&request);
             if let Some(api_key) = &self.config.api_key {
                 builder = builder.bearer_auth(api_key);
             }
@@ -737,16 +742,17 @@ impl EmbeddingEngine {
                     truncate_for_error(&body)
                 )));
             }
-            let parsed: RerankResponse = serde_json::from_str(&body).map_err(|error| {
-                Error::other(format!("invalid reranker response: {error}"))
-            })?;
+            let parsed: RerankResponse = serde_json::from_str(&body)
+                .map_err(|error| Error::other(format!("invalid reranker response: {error}")))?;
             for item in parsed.results {
                 if item.index < chunk.len() {
                     scores.insert(offset + item.index, item.relevance_score);
                 }
             }
             if scores.len() < offset + chunk.len() {
-                return Err(Error::other("reranker response omitted one or more documents"));
+                return Err(Error::other(
+                    "reranker response omitted one or more documents",
+                ));
             }
         }
 

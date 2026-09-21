@@ -682,7 +682,9 @@ impl CoreToolHandler {
         let mut server_config = ServerConfig::default();
         let mut vault_config = vault_config;
         if let Some(ref excluded) = vault_config.excluded_paths {
-            server_config.excluded_paths.extend(excluded.iter().cloned());
+            server_config
+                .excluded_paths
+                .extend(excluded.iter().cloned());
         }
         vault_config.is_default = true; // Mark as default so VaultManager::new() can find it
         server_config.vaults = vec![vault_config];

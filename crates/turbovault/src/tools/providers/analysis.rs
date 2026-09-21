@@ -527,11 +527,7 @@ impl AnalysisProvider {
             serde_json::to_value(status).map_err(|error| McpError::internal(error.to_string()))?,
         )
         .with_duration(start.elapsed().as_millis() as u64)
-        .with_next_steps(&[
-            "embedding_index_status",
-            "semantic_search",
-            "search",
-        ])
+        .with_next_steps(&["embedding_index_status", "semantic_search", "search"])
         .to_json()
     }
 
