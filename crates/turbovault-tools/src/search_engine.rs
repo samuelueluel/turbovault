@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tantivy::collector::TopDocs;
-use tantivy::query::QueryParser;
+use tantivy::query::{EmptyQuery, Query, QueryParser};
 use tantivy::schema::*;
 use tantivy::{Index, ReloadPolicy, TantivyDocument, doc};
 use tracing::instrument;
@@ -392,6 +392,67 @@ impl SearchEngine {
     }
 }
 
+/// Characters that tantivy's query grammar treats as syntax.
+///
+/// Mirrors `SPECIAL_CHARS` in `tantivy-query-grammar`. Any of these appearing
+/// unescaped inside natural-language prose makes `QueryParser::parse_query`
+/// fail, most commonly an apostrophe, which the grammar reserves as a quoted
+/// phrase delimiter (`dad's birthday` is read as an unterminated `'...'`).
+const QUERY_SYNTAX_CHARS: &[char] = &[
+    '+', '^', '`', ':', '{', '}', '"', '\'', '[', ']', '(', ')', '!', '\\', '*',
+];
+
+/// Rewrites query text that tripped tantivy's syntax parser into plain terms.
+///
+/// Syntax characters become separators and runs of whitespace collapse. Returns
+/// `None` when nothing searchable survives (for example a query of only quotes),
+/// which the caller renders as an empty result rather than an error.
+fn sanitize_query_text(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| {
+            if QUERY_SYNTAX_CHARS.contains(&c) {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!collapsed.is_empty()).then_some(collapsed)
+}
+
+/// Parses a query, retrying once against a sanitized form when the raw text is
+/// rejected by tantivy's syntax parser.
+///
+/// Sanitizing beats tantivy's `parse_query_lenient` here: the lenient parser
+/// silently discards everything after the first syntax error, so
+/// `what's my dad's birthday` would degrade to a search for `what` alone,
+/// while the sanitized form keeps every term. Only a query that fails both
+/// parses is a real error.
+fn parse_query_resilient(parser: &QueryParser, raw: &str) -> Result<Box<dyn Query>> {
+    match parser.parse_query(raw) {
+        Ok(query) => Ok(query),
+        Err(error) => {
+            let Some(sanitized) = sanitize_query_text(raw) else {
+                log::warn!("query {raw:?} held no searchable terms; returning an empty query");
+                return Ok(Box::new(EmptyQuery));
+            };
+            match parser.parse_query(&sanitized) {
+                Ok(query) => {
+                    log::warn!(
+                        "query {raw:?} failed syntax parsing ({error}); searched sanitized form {sanitized:?}"
+                    );
+                    Ok(query)
+                }
+                Err(_) => Err(Error::config_error(format!(
+                    "Failed to parse query: {error}"
+                ))),
+            }
+        }
+    }
+}
+
 impl SearchQuery {
     /// Build and execute search results using tantivy
     async fn build_results(self, engine: &SearchEngine) -> Result<Vec<SearchResultInfo>> {
@@ -414,20 +475,26 @@ impl SearchQuery {
             vec![engine.field_title, engine.field_content, engine.field_tags],
         );
 
-        // Enable fuzzy search with Levenshtein distance of 1 for typo tolerance
-        // This makes searches forgiving of single-character mistakes
-        query_parser.set_field_fuzzy(
-            engine.field_title,
-            true,  // enable_fuzzy
-            1,     // distance (1-2 char typos)
-            false, // prefix_only
-        );
-        query_parser.set_field_fuzzy(engine.field_content, true, 1, false);
-        query_parser.set_field_fuzzy(engine.field_tags, true, 1, false);
+        // Fuzzy matching with Levenshtein distance 1 for typo tolerance, so
+        // single-character mistakes still find the note.
+        //
+        // tantivy 0.26's `set_field_fuzzy` signature is
+        // `(field, prefix, distance, transpose_cost_one)`. The second parameter
+        // is a starts-with mode, not an enable switch, and merely registering a
+        // field here is what enables fuzzy matching. Passing `true` for `prefix`
+        // (the old `enable_fuzzy` position) turns every literal into a prefix
+        // query: the 3-letter query `dad` then also matches `advisor`, `adobo`,
+        // and `admin`, because the prefix `ad` is one deletion away. Those
+        // spurious hits all score alike and bury the real note in the tie.
+        for field in [engine.field_title, engine.field_content, engine.field_tags] {
+            query_parser.set_field_fuzzy(
+                field, false, // prefix: plain fuzzy match, not starts-with
+                1,     // distance: one edit (single-character typo)
+                true,  // transpose_cost_one: swapped letters count as one typo
+            );
+        }
 
-        let query = query_parser
-            .parse_query(&query_str)
-            .map_err(|e| Error::config_error(format!("Failed to parse query: {}", e)))?;
+        let query = parse_query_resilient(&query_parser, &query_str)?;
 
         // Execute search
         let top_docs = searcher
@@ -650,6 +717,123 @@ fn extract_snippet(content: &str, query: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: natural-language apostrophes reached the user as
+    /// "Failed to parse query: Syntax Error: dad's birthday" because the
+    /// tantivy grammar reads `'` as a quoted-phrase delimiter.
+    #[test]
+    fn test_sanitize_query_text_keeps_natural_language_terms() {
+        assert_eq!(
+            sanitize_query_text("dad's birthday").as_deref(),
+            Some("dad s birthday")
+        );
+        assert_eq!(
+            sanitize_query_text("what's my dad's birthday").as_deref(),
+            Some("what s my dad s birthday")
+        );
+        assert_eq!(
+            sanitize_query_text("unbalanced \"quote").as_deref(),
+            Some("unbalanced quote")
+        );
+        assert_eq!(
+            sanitize_query_text("already clean").as_deref(),
+            Some("already clean")
+        );
+    }
+
+    #[test]
+    fn test_sanitize_query_text_rejects_termless_input() {
+        assert_eq!(sanitize_query_text("''"), None);
+        assert_eq!(sanitize_query_text("   "), None);
+        assert_eq!(sanitize_query_text("\\"), None);
+    }
+
+    /// Regression for the prefix-expansion defect: `QueryParser::set_field_fuzzy`'s
+    /// second parameter is `prefix` (a starts-with mode), not `enable_fuzzy`.
+    /// Passing `true` there turns every literal into a prefix query, so the
+    /// three-letter query `dad` also matches `advisor`, `adobo`, and `admin`
+    /// (the prefix `ad` is one deletion from `dad`). Every match then scores
+    /// identically and the real note is lost in the tie.
+    #[test]
+    fn test_fuzzy_without_prefix_excludes_unrelated_starts_with_matches() {
+        use tantivy::schema::*;
+
+        let mut schema_builder = Schema::builder();
+        schema_builder.add_text_field("title", TEXT);
+        schema_builder.add_text_field("content", TEXT);
+        let schema = schema_builder.build();
+        let index = tantivy::Index::create_in_ram(schema.clone());
+        let title = schema.get_field("title").unwrap();
+        let content = schema.get_field("content").unwrap();
+
+        let mut writer = index.writer(15_000_000).unwrap();
+        writer
+            .add_document(doc!(title => "Birthdays", content => "Mom 6/17/1952 Dad Sep 10 1956"))
+            .unwrap();
+        writer
+            .add_document(doc!(title => "Advisor", content => "advisor planning workflow notes"))
+            .unwrap();
+        writer
+            .add_document(doc!(title => "Adobo", content => "adobo salsa recipe"))
+            .unwrap();
+        writer.commit().unwrap();
+
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+
+        let plain = {
+            let mut parser = QueryParser::for_index(&index, vec![title, content]);
+            parser.set_field_fuzzy(title, false, 1, false);
+            parser.set_field_fuzzy(content, false, 1, false);
+            searcher
+                .search(
+                    &parser.parse_query("dad").unwrap(),
+                    &TopDocs::with_limit(10).order_by_score(),
+                )
+                .unwrap()
+        };
+        assert_eq!(
+            plain.len(),
+            1,
+            "fuzzy without prefix must match only the document containing 'dad'"
+        );
+
+        let prefix = {
+            let mut parser = QueryParser::for_index(&index, vec![title, content]);
+            parser.set_field_fuzzy(title, true, 1, false);
+            parser.set_field_fuzzy(content, true, 1, false);
+            searcher
+                .search(
+                    &parser.parse_query("dad").unwrap(),
+                    &TopDocs::with_limit(10).order_by_score(),
+                )
+                .unwrap()
+        };
+        assert!(
+            prefix.len() > plain.len(),
+            "prefix mode is expected to over-match; that is the defect being guarded against"
+        );
+    }
+
+    /// The sanitized form must actually parse where the raw form does not.
+    #[test]
+    fn test_parse_query_resilient_recovers_from_apostrophe() {
+        use tantivy::schema::*;
+
+        let mut schema_builder = Schema::builder();
+        schema_builder.add_text_field("title", TEXT);
+        schema_builder.add_text_field("content", TEXT);
+        let schema = schema_builder.build();
+        let index = tantivy::Index::create_in_ram(schema.clone());
+        let title = schema.get_field("title").unwrap();
+        let content = schema.get_field("content").unwrap();
+
+        let parser = QueryParser::for_index(&index, vec![title, content]);
+        assert!(parser.parse_query("dad's birthday").is_err());
+        assert!(parse_query_resilient(&parser, "dad's birthday").is_ok());
+        assert!(parse_query_resilient(&parser, "dad birthday").is_ok());
+        assert!(parse_query_resilient(&parser, "''").is_ok());
+    }
 
     #[test]
     fn test_extract_keywords() {

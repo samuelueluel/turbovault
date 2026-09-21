@@ -563,16 +563,37 @@ impl EmbeddingEngine {
         limit: usize,
     ) -> Result<Vec<HybridSearchResult>> {
         let candidate_limit = limit.saturating_mul(5).clamp(20, 100);
+        // Both retrieval channels degrade independently: a dead embedding sidecar
+        // must not take out lexical search, and an unparseable lexical query must
+        // not discard dense candidates that already succeeded. When both channels
+        // come back empty and at least one of them failed, the failure is surfaced
+        // as an error instead of a silent empty success.
+        let mut dense_error: Option<Error> = None;
+        let mut sparse_error: Option<Error> = None;
         let dense = match self.search(query, candidate_limit).await {
             Ok(results) => results,
             Err(error) => {
                 log::warn!("dense search unavailable in hybrid retrieval, using sparse: {error}");
+                dense_error = Some(error);
                 Vec::new()
             }
         };
-        let sparse = search_engine
+        let sparse = match search_engine
             .advanced_search(SearchQuery::new(query).limit(candidate_limit))
-            .await?;
+            .await
+        {
+            Ok(results) => results,
+            Err(error) => {
+                log::warn!("sparse search unavailable in hybrid retrieval, using dense: {error}");
+                sparse_error = Some(error);
+                Vec::new()
+            }
+        };
+        if dense.is_empty() && sparse.is_empty() {
+            if let Some(error) = dense_error.or(sparse_error) {
+                return Err(error);
+            }
+        }
 
         let mut fused: HashMap<String, HybridAccumulator> = HashMap::new();
         for (offset, result) in dense.into_iter().enumerate() {
