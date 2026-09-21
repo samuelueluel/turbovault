@@ -111,6 +111,51 @@ use self::templates::TemplateProvider;
 use self::vault::VaultProvider;
 use super::CoreToolHandler;
 
+/// Remove Rust-specific numeric `format` annotations from advertised schemas.
+///
+/// Schemars emits formats such as `uint`, `uint8`, `uint64`, `int32`, and
+/// `double` for Rust numeric types. Those are useful to Rust-side consumers,
+/// but they are not standard JSON Schema formats and common MCP clients (AJV
+/// in particular) print a warning for each one while compiling tool schemas.
+/// The actual constraints are already represented by `type`, `minimum`, and
+/// `maximum`, so dropping only the numeric annotation preserves the schema's
+/// meaning without polluting a client's terminal or logs.
+fn strip_numeric_formats(tool: &mut Tool) {
+    fn visit(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                let numeric = match map.get("type") {
+                    Some(serde_json::Value::String(kind)) => {
+                        matches!(kind.as_str(), "integer" | "number")
+                    }
+                    Some(serde_json::Value::Array(types)) => types.iter().any(|kind| {
+                        matches!(kind, serde_json::Value::String(kind) if kind == "integer" || kind == "number")
+                    }),
+                    _ => false,
+                };
+                if numeric {
+                    map.remove("format");
+                }
+                for nested in map.values_mut() {
+                    visit(nested);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    visit(item);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(serde_json::Value::Object(properties)) = tool.input_schema.properties.as_mut() {
+        for schema in properties.values_mut() {
+            visit(schema);
+        }
+    }
+}
+
 #[cfg(feature = "plugin-api")]
 #[derive(Clone)]
 struct PluginProviderAdapter {
@@ -681,6 +726,13 @@ impl ObsidianMcpServer {
 
             (hooks, shutdown, mounted_plugins)
         };
+
+        // Keep the public MCP catalog portable across clients. The mounted
+        // providers retain their native handlers for dispatch; only the copy
+        // exposed by tools/list needs this wire-level cleanup.
+        for tool in &mut tools {
+            strip_numeric_formats(tool);
+        }
 
         Ok(Self {
             core,
@@ -1500,6 +1552,45 @@ mod tests {
                 stray.is_empty(),
                 "{name}: root-only keywords {stray:?} found inside properties"
             );
+        }
+    }
+
+    #[test]
+    fn numeric_tool_schemas_do_not_advertise_rust_only_formats() {
+        fn assert_clean(value: &Value, tool_name: &str) {
+            match value {
+                Value::Object(map) => {
+                    let numeric = match map.get("type") {
+                        Some(Value::String(kind)) => matches!(kind.as_str(), "integer" | "number"),
+                        Some(Value::Array(types)) => types.iter().any(|kind| {
+                            matches!(kind, Value::String(kind) if kind == "integer" || kind == "number")
+                        }),
+                        _ => false,
+                    };
+                    assert!(
+                        !numeric || !map.contains_key("format"),
+                        "{tool_name}: numeric schema still contains a non-portable format"
+                    );
+                    for nested in map.values() {
+                        assert_clean(nested, tool_name);
+                    }
+                }
+                Value::Array(items) => {
+                    for item in items {
+                        assert_clean(item, tool_name);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let server = ObsidianMcpServer::new().expect("provider composition");
+        for tool in server.list_tools() {
+            if let Some(Value::Object(properties)) = tool.input_schema.properties.as_ref() {
+                for schema in properties.values() {
+                    assert_clean(schema, &tool.name);
+                }
+            }
         }
     }
 

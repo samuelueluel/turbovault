@@ -31,7 +31,6 @@
       "additionalProperties": false,
       "properties": {
         "head_lines": {
-          "format": "uint",
           "minimum": 0,
           "type": [
             "integer",
@@ -45,7 +44,6 @@
           ]
         },
         "heading_level": {
-          "format": "uint8",
           "maximum": 255,
           "minimum": 0,
           "type": [
@@ -54,7 +52,6 @@
           ]
         },
         "last_sections": {
-          "format": "uint",
           "minimum": 0,
           "type": [
             "integer",
@@ -65,7 +62,6 @@
           "type": "string"
         },
         "tail_lines": {
-          "format": "uint",
           "minimum": 0,
           "type": [
             "integer",
@@ -349,7 +345,6 @@
       "additionalProperties": false,
       "properties": {
         "max_hops": {
-          "format": "uint",
           "minimum": 0,
           "type": [
             "integer",
@@ -383,7 +378,6 @@
       "additionalProperties": false,
       "properties": {
         "top_n": {
-          "format": "uint",
           "minimum": 0,
           "type": [
             "integer",
@@ -600,7 +594,6 @@
           ]
         },
         "limit": {
-          "format": "uint",
           "minimum": 0,
           "type": [
             "integer",
@@ -1800,7 +1793,6 @@
           "type": "string"
         },
         "limit": {
-          "format": "int32",
           "type": [
             "integer",
             "null"
@@ -2014,7 +2006,6 @@
       "additionalProperties": false,
       "properties": {
         "bottom_n": {
-          "format": "uint",
           "minimum": 0,
           "type": [
             "integer",
@@ -2070,7 +2061,6 @@
       "additionalProperties": false,
       "properties": {
         "limit": {
-          "format": "uint",
           "minimum": 0,
           "type": [
             "integer",
@@ -2249,7 +2239,6 @@
       "additionalProperties": false,
       "properties": {
         "limit": {
-          "format": "uint",
           "minimum": 0,
           "type": [
             "integer",
@@ -2257,7 +2246,6 @@
           ]
         },
         "threshold_days": {
-          "format": "uint64",
           "minimum": 0,
           "type": [
             "integer",
@@ -2287,7 +2275,6 @@
       "additionalProperties": false,
       "properties": {
         "limit": {
-          "format": "uint",
           "minimum": 0,
           "type": [
             "integer",
@@ -2362,7 +2349,6 @@
       "additionalProperties": false,
       "properties": {
         "limit": {
-          "format": "uint",
           "minimum": 0,
           "type": [
             "integer",
@@ -2397,7 +2383,6 @@
       "additionalProperties": false,
       "properties": {
         "limit": {
-          "format": "uint",
           "minimum": 0,
           "type": [
             "integer",
@@ -2405,7 +2390,6 @@
           ]
         },
         "threshold": {
-          "format": "double",
           "type": [
             "number",
             "null"
@@ -2462,7 +2446,6 @@
       "additionalProperties": false,
       "properties": {
         "limit": {
-          "format": "uint",
           "minimum": 0,
           "type": [
             "integer",
