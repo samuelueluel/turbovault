@@ -563,7 +563,13 @@ impl EmbeddingEngine {
         limit: usize,
     ) -> Result<Vec<HybridSearchResult>> {
         let candidate_limit = limit.saturating_mul(5).clamp(20, 100);
-        let dense = self.search(query, candidate_limit).await?;
+        let dense = match self.search(query, candidate_limit).await {
+            Ok(results) => results,
+            Err(error) => {
+                log::warn!("dense search unavailable in hybrid retrieval, using sparse: {error}");
+                Vec::new()
+            }
+        };
         let sparse = search_engine
             .advanced_search(SearchQuery::new(query).limit(candidate_limit))
             .await?;
@@ -645,19 +651,27 @@ impl EmbeddingEngine {
                 })
                 .collect();
 
-            let reranked = self.rerank(query, &documents).await?;
-            let mut reranked_pool: Vec<HybridAccumulator> = Vec::with_capacity(pool_size);
-            for (new_rank, (orig_idx, score)) in reranked.into_iter().enumerate() {
-                if orig_idx < pool.len() {
-                    let mut item = pool[orig_idx].clone();
-                    item.rerank_score = Some(score);
-                    item.rerank_rank = Some(new_rank + 1);
-                    reranked_pool.push(item);
+            let reranked = match self.rerank(query, &documents).await {
+                Ok(results) => results,
+                Err(error) => {
+                    log::warn!("reranker unavailable in hybrid retrieval, keeping RRF order: {error}");
+                    Vec::new()
                 }
+            };
+            if !reranked.is_empty() {
+                let mut reranked_pool: Vec<HybridAccumulator> = Vec::with_capacity(pool_size);
+                for (new_rank, (orig_idx, score)) in reranked.into_iter().enumerate() {
+                    if orig_idx < pool.len() {
+                        let mut item = pool[orig_idx].clone();
+                        item.rerank_score = Some(score);
+                        item.rerank_rank = Some(new_rank + 1);
+                        reranked_pool.push(item);
+                    }
+                }
+                let remaining = results[pool_size..].to_vec();
+                results = reranked_pool;
+                results.extend(remaining);
             }
-            let remaining = results[pool_size..].to_vec();
-            results = reranked_pool;
-            results.extend(remaining);
         }
 
         results.truncate(limit);

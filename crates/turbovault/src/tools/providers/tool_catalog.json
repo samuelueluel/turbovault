@@ -2274,13 +2274,14 @@
       "tags": [
         "read",
         "search",
-        "semantic"
+        "semantic",
+        "embeddings"
       ]
     },
     "annotations": {
       "readOnlyHint": true
     },
-    "description": "Find notes semantically similar to a query using TF-IDF cosine similarity (finds conceptual matches beyond exact keyword overlap)",
+    "description": "Search vault passages by semantic similarity using hybrid neural retrieval (BM25 + Qwen3 dense embeddings + cross-encoder reranking)",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
@@ -2303,78 +2304,6 @@
       "type": "object"
     },
     "name": "semantic_search"
-  },
-  {
-    "_meta": {
-      "tags": [
-        "read",
-        "search",
-        "semantic",
-        "embeddings"
-      ]
-    },
-    "annotations": {
-      "readOnlyHint": true
-    },
-    "description": "Find heading-aware note chunks using learned dense embeddings from the configured OpenAI-compatible local endpoint",
-    "inputSchema": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "additionalProperties": false,
-      "properties": {
-        "limit": {
-          "format": "uint",
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "query": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "query"
-      ],
-      "type": "object"
-    },
-    "name": "embedding_search"
-  },
-  {
-    "_meta": {
-      "tags": [
-        "read",
-        "search",
-        "semantic",
-        "embeddings"
-      ]
-    },
-    "annotations": {
-      "readOnlyHint": true
-    },
-    "description": "Fuse sparse full-text retrieval with dense embedding retrieval using reciprocal-rank fusion",
-    "inputSchema": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "additionalProperties": false,
-      "properties": {
-        "limit": {
-          "format": "uint",
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "query": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "query"
-      ],
-      "type": "object"
-    },
-    "name": "hybrid_search"
   },
   {
     "_meta": {
