@@ -260,9 +260,15 @@ struct ScanSpec {
 
 impl ScanSpec {
     fn new(config: &ServerConfig, root: PathBuf) -> Self {
+        let mut excluded = config.excluded_paths.clone();
+        if let Ok(default_vault) = config.default_vault() {
+            if let Some(ref vault_excluded) = default_vault.excluded_paths {
+                excluded.extend(vault_excluded.iter().cloned());
+            }
+        }
         Self {
             root,
-            excluded: config.excluded_paths.clone(),
+            excluded,
             allowed_extensions: config
                 .allowed_extensions
                 .iter()

@@ -34,9 +34,12 @@ const DEFAULT_MODEL: &str = "Qwen/Qwen3-Embedding-8B-GGUF";
 const DEFAULT_CHUNK_CHARS: usize = 2400;
 const DEFAULT_CHUNK_OVERLAP: usize = 200;
 const DEFAULT_BATCH_SIZE: usize = 16;
+const DEFAULT_RERANKER_ENDPOINT: &str = "http://127.0.0.1:8083/v1/rerank";
+const DEFAULT_RERANKER_MODEL: &str = "BAAI/bge-reranker-v2-m3";
+const DEFAULT_RERANK_BATCH_SIZE: usize = 12;
 const RRF_K: f64 = 60.0;
 
-/// Runtime configuration for the external embedding endpoint.
+/// Runtime configuration for the external embedding endpoint and local reranker.
 #[derive(Debug, Clone)]
 pub struct EmbeddingConfig {
     pub endpoint: String,
@@ -47,6 +50,10 @@ pub struct EmbeddingConfig {
     pub chunk_chars: usize,
     pub chunk_overlap: usize,
     pub batch_size: usize,
+    pub reranker_endpoint: String,
+    pub reranker_model: String,
+    pub reranker_enabled: bool,
+    pub reranker_batch_size: usize,
 }
 
 impl EmbeddingConfig {
@@ -73,6 +80,16 @@ impl EmbeddingConfig {
             ));
         }
 
+        let reranker_endpoint = env::var("TURBOVAULT_RERANKER_ENDPOINT")
+            .unwrap_or_else(|_| DEFAULT_RERANKER_ENDPOINT.to_string());
+        let reranker_model = env::var("TURBOVAULT_RERANKER_MODEL")
+            .unwrap_or_else(|_| DEFAULT_RERANKER_MODEL.to_string());
+        let reranker_enabled = env::var("TURBOVAULT_RERANKER_ENABLED")
+            .map(|val| !val.trim().is_empty() && val != "0" && !val.eq_ignore_ascii_case("false"))
+            .unwrap_or(!reranker_endpoint.trim().is_empty());
+        let reranker_batch_size =
+            env_usize("TURBOVAULT_RERANKER_BATCH_SIZE", DEFAULT_RERANK_BATCH_SIZE)?;
+
         let index_root = env::var_os("TURBOVAULT_EMBEDDING_INDEX_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(default_index_root);
@@ -89,6 +106,10 @@ impl EmbeddingConfig {
             chunk_chars,
             chunk_overlap,
             batch_size,
+            reranker_endpoint,
+            reranker_model,
+            reranker_enabled,
+            reranker_batch_size,
         })
     }
 }
@@ -170,6 +191,8 @@ pub struct HybridSearchResult {
     pub sparse_score: Option<f64>,
     pub dense_rank: Option<usize>,
     pub sparse_rank: Option<usize>,
+    pub rerank_score: Option<f64>,
+    pub rerank_rank: Option<usize>,
     pub chunk_id: Option<String>,
 }
 
@@ -187,12 +210,34 @@ pub struct EmbeddingIndexStatus {
     pub built_at: Option<String>,
     pub schema_version: Option<u32>,
     pub chunker_version: Option<String>,
+    pub reranker_endpoint: String,
+    pub reranker_model: String,
+    pub reranker_enabled: bool,
 }
 
 #[derive(Debug, Serialize)]
 struct EmbeddingRequest<'a> {
     model: &'a str,
     input: &'a [String],
+}
+
+#[derive(Debug, Serialize)]
+struct RerankRequest<'a> {
+    model: &'a str,
+    query: &'a str,
+    documents: &'a [String],
+}
+
+#[derive(Debug, Deserialize)]
+struct RerankResponse {
+    #[serde(default)]
+    results: Vec<RerankItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RerankItem {
+    index: usize,
+    relevance_score: f64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -279,6 +324,9 @@ impl EmbeddingEngine {
             built_at: state.as_ref().map(|index| index.built_at.clone()),
             schema_version: state.as_ref().map(|index| index.schema_version),
             chunker_version: state.as_ref().map(|index| index.chunker_version.clone()),
+            reranker_endpoint: self.config.reranker_endpoint.clone(),
+            reranker_model: self.config.reranker_model.clone(),
+            reranker_enabled: self.config.reranker_enabled,
         }
     }
 
@@ -294,8 +342,29 @@ impl EmbeddingEngine {
         self.mark_stale().await?;
         self.manager.ensure_fresh().await;
 
+        let existing_chunks_by_path: HashMap<String, (String, Vec<EmbeddingChunk>)> = {
+            let state = self.state.read().await;
+            let mut map = HashMap::new();
+            if let Some(index) = state.as_ref() {
+                if index.schema_version == INDEX_SCHEMA_VERSION
+                    && index.chunker_version == CHUNKER_VERSION
+                    && index.model == self.config.model
+                {
+                    for chunk in &index.chunks {
+                        map.entry(chunk.path.clone())
+                            .or_insert_with(|| (chunk.content_hash.clone(), Vec::new()))
+                            .1
+                            .push(chunk.clone());
+                    }
+                }
+            }
+            map
+        };
+
         let files = self.manager.scan_vault().await?;
+        let mut final_chunks = Vec::new();
         let mut pending = Vec::new();
+
         for file_path in files {
             if !file_path
                 .extension()
@@ -304,14 +373,27 @@ impl EmbeddingEngine {
             {
                 continue;
             }
-            let Ok(vault_file) = self.manager.parse_file(&file_path).await else {
-                continue;
-            };
             let relative = file_path
                 .strip_prefix(self.manager.vault_path())
                 .unwrap_or(&file_path)
                 .to_string_lossy()
                 .to_string();
+            if is_path_excluded(&relative) {
+                continue;
+            }
+            let Ok(vault_file) = self.manager.parse_file(&file_path).await else {
+                continue;
+            };
+            let content_hash = hex_hash(vault_file.content.as_bytes());
+
+            // Reuse pre-existing chunks if content_hash has not changed
+            if let Some((cached_hash, cached_chunks)) = existing_chunks_by_path.get(&relative) {
+                if cached_hash == &content_hash && !cached_chunks.is_empty() {
+                    final_chunks.extend(cached_chunks.clone());
+                    continue;
+                }
+            }
+
             let title = vault_file
                 .frontmatter
                 .as_ref()
@@ -331,7 +413,7 @@ impl EmbeddingEngine {
                         .unwrap_or("Untitled")
                         .to_string()
                 });
-            let content_hash = hex_hash(vault_file.content.as_bytes());
+
             for (chunk_number, chunk) in chunk_markdown(
                 &vault_file.content,
                 self.config.chunk_chars,
@@ -363,35 +445,37 @@ impl EmbeddingEngine {
             }
         }
 
-        let mut chunks = Vec::with_capacity(pending.len());
-        for batch in pending.chunks(self.config.batch_size) {
-            let inputs: Vec<String> = batch.iter().map(|chunk| chunk.input.clone()).collect();
-            let vectors = self.embed(&inputs).await?;
-            if vectors.len() != batch.len() {
-                return Err(Error::other(format!(
-                    "embedding endpoint returned {} vectors for {} inputs",
-                    vectors.len(),
-                    batch.len()
-                )));
-            }
-            for (pending_chunk, embedding) in batch.iter().zip(vectors) {
-                chunks.push(EmbeddingChunk {
-                    id: pending_chunk.id.clone(),
-                    path: pending_chunk.path.clone(),
-                    title: pending_chunk.title.clone(),
-                    heading: pending_chunk.heading.clone(),
-                    text: pending_chunk.text.clone(),
-                    content_hash: pending_chunk.content_hash.clone(),
-                    embedding,
-                });
+        if !pending.is_empty() {
+            for batch in pending.chunks(self.config.batch_size) {
+                let inputs: Vec<String> = batch.iter().map(|chunk| chunk.input.clone()).collect();
+                let vectors = self.embed(&inputs).await?;
+                if vectors.len() != batch.len() {
+                    return Err(Error::other(format!(
+                        "embedding endpoint returned {} vectors for {} inputs",
+                        vectors.len(),
+                        batch.len()
+                    )));
+                }
+                for (pending_chunk, embedding) in batch.iter().zip(vectors) {
+                    final_chunks.push(EmbeddingChunk {
+                        id: pending_chunk.id.clone(),
+                        path: pending_chunk.path.clone(),
+                        title: pending_chunk.title.clone(),
+                        heading: pending_chunk.heading.clone(),
+                        text: pending_chunk.text.clone(),
+                        content_hash: pending_chunk.content_hash.clone(),
+                        embedding,
+                    });
+                }
             }
         }
 
-        let dimension = chunks
+        final_chunks.sort_by(|a, b| a.id.cmp(&b.id));
+        let dimension = final_chunks
             .first()
             .map(|chunk| chunk.embedding.len())
             .unwrap_or(0);
-        if chunks
+        if final_chunks
             .iter()
             .any(|chunk| chunk.embedding.len() != dimension)
         {
@@ -406,7 +490,7 @@ impl EmbeddingEngine {
             vault_path: self.manager.vault_path().to_string_lossy().to_string(),
             dimension,
             built_at: chrono::Utc::now().to_rfc3339(),
-            chunks,
+            chunks: final_chunks,
         };
         let bytes = bincode::serialize(&index)
             .map_err(|error| Error::other(format!("failed to encode embedding index: {error}")))?;
@@ -496,14 +580,19 @@ impl EmbeddingEngine {
                     Some(result.chunk_id.clone()),
                 )
             });
-            if entry.dense_rank.is_none() || result.score > entry.dense_score.unwrap_or(-1.0) {
+            if entry.dense_rank.is_none() {
                 entry.heading = result.heading;
                 entry.text = result.text;
                 entry.chunk_id = Some(result.chunk_id);
                 entry.dense_score = Some(result.score);
                 entry.dense_rank = Some(rank);
+                entry.dense_rrf = 1.0 / (RRF_K + rank as f64);
+            } else if result.score > entry.dense_score.unwrap_or(-1.0) {
+                entry.heading = result.heading;
+                entry.text = result.text;
+                entry.chunk_id = Some(result.chunk_id);
+                entry.dense_score = Some(result.score);
             }
-            entry.rrf_score += 1.0 / (RRF_K + rank as f64);
         }
         for (offset, result) in sparse.into_iter().enumerate() {
             let rank = offset + 1;
@@ -520,19 +609,115 @@ impl EmbeddingEngine {
             entry.preview = result.preview;
             entry.snippet = result.snippet;
             entry.sparse_score = Some(result.score);
-            entry.sparse_rank = Some(rank);
-            entry.rrf_score += 1.0 / (RRF_K + rank as f64);
+            if entry.sparse_rank.is_none() {
+                entry.sparse_rank = Some(rank);
+                entry.sparse_rrf = 1.0 / (RRF_K + rank as f64);
+            }
         }
 
         let mut results: Vec<HybridAccumulator> = fused.into_values().collect();
+        for item in &mut results {
+            item.rrf_score = item.dense_rrf + item.sparse_rrf;
+        }
         results.sort_by(|left, right| {
             right
                 .rrf_score
                 .partial_cmp(&left.rrf_score)
                 .unwrap_or(Ordering::Equal)
         });
+
+        // Second-stage cross-encoder rerank if enabled and endpoint is configured
+        if self.config.reranker_enabled
+            && !self.config.reranker_endpoint.trim().is_empty()
+            && !results.is_empty()
+        {
+            let pool_size = limit.max(12).min(results.len());
+            let pool = &results[..pool_size];
+            let documents: Vec<String> = pool
+                .iter()
+                .map(|item| {
+                    let section = item
+                        .heading
+                        .as_deref()
+                        .map(|h| format!("Section: {h}\n"))
+                        .unwrap_or_default();
+                    format!("Title: {}\n{}Content:\n{}", item.title, section, item.text)
+                })
+                .collect();
+
+            let reranked = self.rerank(query, &documents).await?;
+            let mut reranked_pool: Vec<HybridAccumulator> = Vec::with_capacity(pool_size);
+            for (new_rank, (orig_idx, score)) in reranked.into_iter().enumerate() {
+                if orig_idx < pool.len() {
+                    let mut item = pool[orig_idx].clone();
+                    item.rerank_score = Some(score);
+                    item.rerank_rank = Some(new_rank + 1);
+                    reranked_pool.push(item);
+                }
+            }
+            let remaining = results[pool_size..].to_vec();
+            results = reranked_pool;
+            results.extend(remaining);
+        }
+
         results.truncate(limit);
         Ok(results.into_iter().map(HybridAccumulator::finish).collect())
+    }
+
+    pub async fn rerank(&self, query: &str, documents: &[String]) -> Result<Vec<(usize, f64)>> {
+        if documents.is_empty() {
+            return Ok(Vec::new());
+        }
+        if !self.config.reranker_enabled || self.config.reranker_endpoint.trim().is_empty() {
+            return Err(Error::config_error("reranker is not configured or enabled"));
+        }
+
+        let mut scores: HashMap<usize, f64> = HashMap::new();
+        let batch_size = self.config.reranker_batch_size.max(1);
+
+        for (batch_idx, chunk) in documents.chunks(batch_size).enumerate() {
+            let offset = batch_idx * batch_size;
+            let request = RerankRequest {
+                model: &self.config.reranker_model,
+                query,
+                documents: chunk,
+            };
+            let mut builder = self.client.post(&self.config.reranker_endpoint).json(&request);
+            if let Some(api_key) = &self.config.api_key {
+                builder = builder.bearer_auth(api_key);
+            }
+            let response = builder.send().await.map_err(|error| {
+                Error::other(format!(
+                    "reranker request to {} failed: {error}",
+                    self.config.reranker_endpoint
+                ))
+            })?;
+            let status = response.status();
+            let body = response.text().await.map_err(|error| {
+                Error::other(format!("failed to read reranker response body: {error}"))
+            })?;
+            if !status.is_success() {
+                return Err(Error::other(format!(
+                    "reranker endpoint returned HTTP {status}: {}",
+                    truncate_for_error(&body)
+                )));
+            }
+            let parsed: RerankResponse = serde_json::from_str(&body).map_err(|error| {
+                Error::other(format!("invalid reranker response: {error}"))
+            })?;
+            for item in parsed.results {
+                if item.index < chunk.len() {
+                    scores.insert(offset + item.index, item.relevance_score);
+                }
+            }
+            if scores.len() < offset + chunk.len() {
+                return Err(Error::other("reranker response omitted one or more documents"));
+            }
+        }
+
+        let mut ranked: Vec<(usize, f64)> = scores.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+        Ok(ranked)
     }
 
     async fn embed(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
@@ -726,6 +911,20 @@ fn truncate_for_error(body: &str) -> String {
     body.chars().take(500).collect()
 }
 
+fn is_path_excluded(path: &str) -> bool {
+    let p = Path::new(path);
+    for component in p.components() {
+        if let std::path::Component::Normal(c) = component {
+            let s = c.to_string_lossy();
+            if s == ".trash" || s == ".obsidian" || s == ".git" || s == "node_modules" {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[derive(Clone)]
 struct HybridAccumulator {
     path: String,
     title: String,
@@ -733,11 +932,15 @@ struct HybridAccumulator {
     text: String,
     preview: String,
     snippet: String,
+    dense_rrf: f64,
+    sparse_rrf: f64,
     rrf_score: f64,
     dense_score: Option<f64>,
     sparse_score: Option<f64>,
     dense_rank: Option<usize>,
     sparse_rank: Option<usize>,
+    rerank_score: Option<f64>,
+    rerank_rank: Option<usize>,
     chunk_id: Option<String>,
 }
 
@@ -756,11 +959,15 @@ impl HybridAccumulator {
             preview: text.clone(),
             text,
             snippet: String::new(),
+            dense_rrf: 0.0,
+            sparse_rrf: 0.0,
             rrf_score: 0.0,
             dense_score: None,
             sparse_score: None,
             dense_rank: None,
             sparse_rank: None,
+            rerank_score: None,
+            rerank_rank: None,
             chunk_id,
         }
     }
@@ -778,6 +985,8 @@ impl HybridAccumulator {
             sparse_score: self.sparse_score,
             dense_rank: self.dense_rank,
             sparse_rank: self.sparse_rank,
+            rerank_score: self.rerank_score,
+            rerank_rank: self.rerank_rank,
             chunk_id: self.chunk_id,
         }
     }
@@ -809,5 +1018,42 @@ mod tests {
     fn stable_slug_is_deterministic_and_short() {
         assert_eq!(stable_slug("vault"), stable_slug("vault"));
         assert_eq!(stable_slug("vault").len(), 24);
+    }
+
+    #[test]
+    fn path_exclusion_detects_trash_and_obsidian() {
+        assert!(is_path_excluded(".trash/note.md"));
+        assert!(is_path_excluded("folder/.trash/note.md"));
+        assert!(is_path_excluded(".obsidian/workspace.json"));
+        assert!(!is_path_excluded("10_Projects/note.md"));
+        assert!(!is_path_excluded("trash_collection/note.md"));
+    }
+
+    #[test]
+    fn rrf_deduplication_prevents_multi_chunk_inflation() {
+        let mut entry = HybridAccumulator::new(
+            "test.md".to_string(),
+            "Test".to_string(),
+            None,
+            "text".to_string(),
+            Some("test.md#0".to_string()),
+        );
+        entry.dense_rank = Some(1);
+        entry.dense_rrf = 1.0 / (RRF_K + 1.0);
+        entry.sparse_rank = Some(2);
+        entry.sparse_rrf = 1.0 / (RRF_K + 2.0);
+        entry.rrf_score = entry.dense_rrf + entry.sparse_rrf;
+
+        let expected = (1.0 / 61.0) + (1.0 / 62.0);
+        assert!((entry.rrf_score - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rerank_response_deserialization() {
+        let json = r#"{"model":"gpustack/bge-reranker-v2-m3-GGUF","object":"list","results":[{"index":1,"relevance_score":-2.63},{"index":0,"relevance_score":-4.14}]}"#;
+        let parsed: RerankResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.results.len(), 2);
+        assert_eq!(parsed.results[0].index, 1);
+        assert!((parsed.results[0].relevance_score - (-2.63)).abs() < 1e-4);
     }
 }
