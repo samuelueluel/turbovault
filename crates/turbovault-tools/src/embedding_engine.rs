@@ -1,9 +1,9 @@
 //! Dense and hybrid retrieval for Markdown vaults.
 //!
 //! The engine deliberately keeps embedding inference outside TurboVault. It
-//! talks to an OpenAI-compatible `/embeddings` endpoint (normally the local
-//! Qwen3 service used by the Zotero MCP fork), persists a versioned local
-//! vector index, and combines dense results with TurboVault's sparse search.
+//! talks to a configurable OpenAI-compatible `/embeddings` endpoint, which may
+//! be local or hosted, persists a versioned local vector index, and combines
+//! dense results with TurboVault's sparse search.
 //!
 //! The index is not stored in the vault. It is derived state keyed by the
 //! vault path, embedding model, and chunker version.
@@ -12,9 +12,9 @@
 //! correctness problem:
 //!
 //! - *Incompatible*: the stored index was built against a different model,
-//!   schema, chunker, or vault path. Its vectors live in a different space, so
-//!   cosine similarity against a fresh query vector is meaningless. Dense
-//!   search refuses until `reindex_embeddings` runs.
+//!   schema, chunker, vault path, or document-indexing policy. The vectors may
+//!   live in a different space or retain a source set the current process did
+//!   not authorize, so dense search refuses until `reindex_embeddings` runs.
 //! - *Stale*: the vault was written to since the index was built. The vectors
 //!   are merely out of date and are still served, because they remain in the
 //!   same space and rank correctly. The sparse channel is updated eagerly on
@@ -27,26 +27,28 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::RwLock;
 use turbovault_core::prelude::*;
 use turbovault_parser::to_plain_text;
-use turbovault_vault::VaultManager;
+use turbovault_vault::{ScannedNote, VaultManager};
 
+use crate::document_extract::{extract_docx_markdown, extract_pdf_markdown};
 use crate::search_engine::{SearchEngine, SearchQuery};
 
-const INDEX_SCHEMA_VERSION: u32 = 1;
-const CHUNKER_VERSION: &str = "markdown-heading-v1";
+const INDEX_SCHEMA_VERSION: u32 = 2;
+const CHUNKER_VERSION: &str = "markdown-hierarchy-v2";
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:8082/v1/embeddings";
 const DEFAULT_MODEL: &str = "Qwen/Qwen3-Embedding-8B-GGUF";
 const DEFAULT_CHUNK_CHARS: usize = 2400;
 const DEFAULT_CHUNK_OVERLAP: usize = 200;
 const DEFAULT_BATCH_SIZE: usize = 16;
+const DEFAULT_DOCUMENT_MAX_BYTES: usize = 50 * 1024 * 1024;
 const DEFAULT_RERANKER_ENDPOINT: &str = "http://127.0.0.1:8083/v1/rerank";
 const DEFAULT_RERANKER_MODEL: &str = "BAAI/bge-reranker-v2-m3";
 const DEFAULT_RERANK_BATCH_SIZE: usize = 12;
@@ -63,7 +65,11 @@ const DEFAULT_REFRESH_AFTER_SECS: u64 = 21_600;
 /// re-attempted on every search.
 const REFRESH_RETRY_BACKOFF: Duration = Duration::from_secs(300);
 
-/// Runtime configuration for the external embedding endpoint and local reranker.
+/// Runtime configuration for external embedding and reranking endpoints.
+///
+/// Both endpoints may be local or hosted. A dedicated reranker key takes
+/// precedence when configured; otherwise the embedding key is reused so one
+/// provider such as OpenRouter can serve both requests.
 #[derive(Debug, Clone)]
 pub struct EmbeddingConfig {
     pub endpoint: String,
@@ -74,9 +80,15 @@ pub struct EmbeddingConfig {
     pub chunk_chars: usize,
     pub chunk_overlap: usize,
     pub batch_size: usize,
+    /// Whether PDF and DOCX attachments are extracted into the derived index.
+    pub document_indexing_enabled: bool,
+    /// Maximum binary attachment size admitted for local extraction.
+    pub document_max_bytes: u64,
     pub reranker_endpoint: String,
     pub reranker_model: String,
     pub reranker_enabled: bool,
+    pub reranker_api_key_configured: bool,
+    reranker_api_key: Option<String>,
     pub reranker_batch_size: usize,
     /// Refresh an out-of-date index when it is at least this old. Zero disables.
     pub refresh_after: Duration,
@@ -105,6 +117,14 @@ impl EmbeddingConfig {
                 "TURBOVAULT_EMBEDDING_BATCH_SIZE must be greater than zero",
             ));
         }
+        let document_indexing_enabled = env_bool("TURBOVAULT_DOCUMENT_INDEXING_ENABLED", false)?;
+        let document_max_bytes =
+            env_usize("TURBOVAULT_DOCUMENT_MAX_BYTES", DEFAULT_DOCUMENT_MAX_BYTES)? as u64;
+        if document_max_bytes == 0 {
+            return Err(Error::config_error(
+                "TURBOVAULT_DOCUMENT_MAX_BYTES must be greater than zero",
+            ));
+        }
 
         let reranker_endpoint = env::var("TURBOVAULT_RERANKER_ENDPOINT")
             .unwrap_or_else(|_| DEFAULT_RERANKER_ENDPOINT.to_string());
@@ -113,6 +133,12 @@ impl EmbeddingConfig {
         let reranker_enabled = env::var("TURBOVAULT_RERANKER_ENABLED")
             .map(|val| !val.trim().is_empty() && val != "0" && !val.eq_ignore_ascii_case("false"))
             .unwrap_or(!reranker_endpoint.trim().is_empty());
+        let reranker_api_key = select_reranker_api_key(
+            env::var("TURBOVAULT_RERANKER_API_KEY")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
+            api_key.as_ref(),
+        );
         let reranker_batch_size =
             env_usize("TURBOVAULT_RERANKER_BATCH_SIZE", DEFAULT_RERANK_BATCH_SIZE)?;
 
@@ -137,13 +163,24 @@ impl EmbeddingConfig {
             chunk_chars,
             chunk_overlap,
             batch_size,
+            document_indexing_enabled,
+            document_max_bytes,
             reranker_endpoint,
             reranker_model,
             reranker_enabled,
+            reranker_api_key_configured: reranker_api_key.is_some(),
+            reranker_api_key,
             reranker_batch_size,
             refresh_after,
         })
     }
+}
+
+fn select_reranker_api_key(
+    dedicated_key: Option<String>,
+    embedding_key: Option<&String>,
+) -> Option<String> {
+    dedicated_key.or_else(|| embedding_key.cloned())
 }
 
 fn env_usize(name: &str, default: usize) -> Result<usize> {
@@ -155,9 +192,26 @@ fn env_usize(name: &str, default: usize) -> Result<usize> {
     }
 }
 
+fn env_bool(name: &str, default: bool) -> Result<bool> {
+    match env::var(name) {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" => Ok(false),
+            _ => Err(Error::config_error(format!(
+                "{name} must be true or false, got {value:?}"
+            ))),
+        },
+        Err(_) => Ok(default),
+    }
+}
+
 fn default_index_root() -> PathBuf {
     if let Some(cache) = env::var_os("XDG_CACHE_HOME") {
         return PathBuf::from(cache).join("turbovault/embeddings");
+    }
+    #[cfg(target_os = "windows")]
+    if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
+        return PathBuf::from(local_app_data).join("turbovault/embeddings");
     }
     if let Some(home) = env::var_os("HOME") {
         return PathBuf::from(home).join(".cache/turbovault/embeddings");
@@ -173,6 +227,13 @@ fn stable_slug(value: &str) -> String {
         .collect()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct DocumentStamp {
+    path: String,
+    size_bytes: u64,
+    modified_millis: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredIndex {
     schema_version: u32,
@@ -181,6 +242,9 @@ struct StoredIndex {
     vault_path: String,
     dimension: usize,
     built_at: String,
+    document_indexing_enabled: bool,
+    document_max_bytes: u64,
+    document_manifest: Vec<DocumentStamp>,
     chunks: Vec<EmbeddingChunk>,
 }
 
@@ -245,9 +309,15 @@ pub struct EmbeddingIndexStatus {
     pub built_at: Option<String>,
     pub schema_version: Option<u32>,
     pub chunker_version: Option<String>,
+    pub document_indexing_enabled: bool,
+    pub document_max_bytes: u64,
+    pub document_files_discovered: usize,
+    pub document_files_indexed: usize,
+    pub document_chunks: usize,
     pub reranker_endpoint: String,
     pub reranker_model: String,
     pub reranker_enabled: bool,
+    pub reranker_api_key_configured: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -261,6 +331,7 @@ struct RerankRequest<'a> {
     model: &'a str,
     query: &'a str,
     documents: &'a [String],
+    top_n: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -322,9 +393,16 @@ fn refresh_due(
 /// Deliberately silent about freshness. An index built from an older snapshot
 /// of the same vault is usable: its vectors were produced by the same model and
 /// chunker, so they live in the same space as a fresh query vector and rank
-/// correctly. Only a change of model, schema, chunker, or vault path makes the
-/// stored vectors incomparable, which is the sole case that must fail closed.
-fn index_mismatch(index: &StoredIndex, model: &str, vault_path: &str) -> Option<&'static str> {
+/// correctly. Model, schema, chunker, and vault changes make vectors unsafe to
+/// compare or reuse; document-indexing changes alter the authorized source set.
+/// Either condition must fail closed until the index is rebuilt.
+fn index_mismatch(
+    index: &StoredIndex,
+    model: &str,
+    vault_path: &str,
+    document_indexing_enabled: bool,
+    document_max_bytes: u64,
+) -> Option<&'static str> {
     if index.schema_version != INDEX_SCHEMA_VERSION {
         return Some("index schema version differs from this build");
     }
@@ -336,6 +414,11 @@ fn index_mismatch(index: &StoredIndex, model: &str, vault_path: &str) -> Option<
     }
     if index.vault_path != vault_path {
         return Some("index was built for a different vault path");
+    }
+    if index.document_indexing_enabled != document_indexing_enabled
+        || index.document_max_bytes != document_max_bytes
+    {
+        return Some("document indexing configuration changed");
     }
     None
 }
@@ -418,19 +501,28 @@ impl EmbeddingEngine {
             let bytes = tokio::fs::read(&index_path).await.map_err(|error| {
                 Error::other(format!("failed to read embedding index: {error}"))
             })?;
-            let parsed: StoredIndex = bincode::deserialize(&bytes).map_err(|error| {
-                Error::other(format!(
-                    "failed to decode embedding index {}; run reindex_embeddings: {error}",
-                    index_path.display()
-                ))
-            })?;
-            incompatible = index_mismatch(
-                &parsed,
-                &config.model,
-                &manager.vault_path().to_string_lossy(),
-            )
-            .is_some();
-            Some(parsed)
+            match bincode::deserialize::<StoredIndex>(&bytes) {
+                Ok(parsed) => {
+                    incompatible = index_mismatch(
+                        &parsed,
+                        &config.model,
+                        &manager.vault_path().to_string_lossy(),
+                        config.document_indexing_enabled,
+                        config.document_max_bytes,
+                    )
+                    .is_some();
+                    Some(parsed)
+                }
+                Err(error) => {
+                    incompatible = true;
+                    log::warn!(
+                        "embedding index {} uses an older or unreadable schema; run \
+                         reindex_embeddings: {error}",
+                        index_path.display()
+                    );
+                    None
+                }
+            }
         } else {
             None
         };
@@ -457,7 +549,34 @@ impl EmbeddingEngine {
     }
 
     pub async fn status(&self) -> EmbeddingIndexStatus {
+        if self.config.document_indexing_enabled
+            && self.document_sources_changed().await.unwrap_or(false)
+        {
+            let _ = self.mark_stale().await;
+        }
         let state = self.state.read().await;
+        let document_chunks = state
+            .as_ref()
+            .map(|index| {
+                index
+                    .chunks
+                    .iter()
+                    .filter(|chunk| is_document_path(&chunk.path))
+                    .count()
+            })
+            .unwrap_or(0);
+        let document_files_indexed = state
+            .as_ref()
+            .map(|index| {
+                index
+                    .chunks
+                    .iter()
+                    .filter(|chunk| is_document_path(&chunk.path))
+                    .map(|chunk| chunk.path.as_str())
+                    .collect::<HashSet<_>>()
+                    .len()
+            })
+            .unwrap_or(0);
         EmbeddingIndexStatus {
             configured: !self.config.endpoint.is_empty() && !self.config.model.is_empty(),
             endpoint: self.config.endpoint.clone(),
@@ -472,9 +591,18 @@ impl EmbeddingEngine {
             built_at: state.as_ref().map(|index| index.built_at.clone()),
             schema_version: state.as_ref().map(|index| index.schema_version),
             chunker_version: state.as_ref().map(|index| index.chunker_version.clone()),
+            document_indexing_enabled: self.config.document_indexing_enabled,
+            document_max_bytes: self.config.document_max_bytes,
+            document_files_discovered: state
+                .as_ref()
+                .map(|index| index.document_manifest.len())
+                .unwrap_or(0),
+            document_files_indexed,
+            document_chunks,
             reranker_endpoint: self.config.reranker_endpoint.clone(),
             reranker_model: self.config.reranker_model.clone(),
             reranker_enabled: self.config.reranker_enabled,
+            reranker_api_key_configured: self.config.reranker_api_key_configured,
         }
     }
 
@@ -514,6 +642,7 @@ impl EmbeddingEngine {
         let files = self.manager.scan_vault().await?;
         let mut final_chunks = Vec::new();
         let mut pending = Vec::new();
+        let mut document_manifest = Vec::new();
 
         for file_path in files {
             if !file_path
@@ -565,34 +694,90 @@ impl EmbeddingEngine {
                         .to_string()
                 });
 
-            for (chunk_number, chunk) in chunk_markdown(
+            queue_text_chunks(
+                &mut pending,
+                &relative,
+                &title,
+                "Markdown note",
                 &vault_file.content,
+                &content_hash,
                 self.config.chunk_chars,
                 self.config.chunk_overlap,
-            )
-            .into_iter()
-            .enumerate()
-            {
-                let plain = to_plain_text(&chunk.markdown);
-                if plain.trim().is_empty() {
+            );
+        }
+
+        if self.config.document_indexing_enabled {
+            let documents = self
+                .manager
+                .scan_files_by_extensions(&["pdf", "docx"], self.config.document_max_bytes)?;
+            document_manifest = document_manifest_for(self.manager.vault_path(), &documents);
+            for document in documents {
+                let file_path = document.path;
+                let relative = file_path
+                    .strip_prefix(self.manager.vault_path())
+                    .unwrap_or(&file_path)
+                    .to_string_lossy()
+                    .to_string();
+                if is_path_excluded(&relative) {
                     continue;
                 }
-                let heading_prefix = chunk
-                    .heading
-                    .as_deref()
-                    .map(|heading| format!("Section: {heading}\n"))
-                    .unwrap_or_default();
-                let input =
-                    format!("Title: {title}\n{heading_prefix}Path: {relative}\nContent:\n{plain}");
-                pending.push(PendingChunk {
-                    id: format!("{relative}#{chunk_number}"),
-                    path: relative.clone(),
-                    title: title.clone(),
-                    heading: chunk.heading,
-                    text: plain,
-                    input,
-                    content_hash: content_hash.clone(),
-                });
+                let bytes = match tokio::fs::read(&file_path).await {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        log::warn!("skipping document {relative:?}: failed to read: {error}");
+                        continue;
+                    }
+                };
+                let content_hash = hex_hash(&bytes);
+                if let Some((cached_hash, cached_chunks)) = existing_chunks_by_path.get(&relative)
+                    && cached_hash == &content_hash
+                    && !cached_chunks.is_empty()
+                {
+                    final_chunks.extend(cached_chunks.clone());
+                    continue;
+                }
+
+                let extension = file_path
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                let source_type = if extension == "pdf" {
+                    "PDF attachment"
+                } else {
+                    "DOCX attachment"
+                };
+                let extracted = tokio::task::spawn_blocking(move || match extension.as_str() {
+                    "pdf" => extract_pdf_markdown(&bytes),
+                    "docx" => extract_docx_markdown(&bytes),
+                    _ => unreachable!("scanner admits only PDF and DOCX"),
+                })
+                .await
+                .map_err(|error| {
+                    Error::other(format!("document extraction task failed: {error}"))
+                })?;
+                let extracted = match extracted {
+                    Ok(text) => text,
+                    Err(error) => {
+                        log::warn!("skipping document {relative:?}: {error}");
+                        continue;
+                    }
+                };
+                let title = file_path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or("Untitled document")
+                    .to_string();
+                queue_text_chunks(
+                    &mut pending,
+                    &relative,
+                    &title,
+                    source_type,
+                    &extracted,
+                    &content_hash,
+                    self.config.chunk_chars,
+                    self.config.chunk_overlap,
+                );
             }
         }
 
@@ -641,6 +826,9 @@ impl EmbeddingEngine {
             vault_path: self.manager.vault_path().to_string_lossy().to_string(),
             dimension,
             built_at: chrono::Utc::now().to_rfc3339(),
+            document_indexing_enabled: self.config.document_indexing_enabled,
+            document_max_bytes: self.config.document_max_bytes,
+            document_manifest,
             chunks: final_chunks,
         };
         let bytes = bincode::serialize(&index)
@@ -663,9 +851,8 @@ impl EmbeddingEngine {
         // or edited since the last reindex.
         if self.incompatible.load(AtomicOrdering::Acquire) {
             return Err(Error::config_error(
-                "embedding index was built with a different model, schema, chunker, or vault \
-                 path, so its vectors are not comparable to a query vector. Run \
-                 reindex_embeddings",
+                "embedding index was built with a different model, schema, chunker, vault \
+                 path, or document-indexing policy. Run reindex_embeddings before dense search",
             ));
         }
         let query = query.trim();
@@ -715,6 +902,20 @@ impl EmbeddingEngine {
             .collect())
     }
 
+    async fn document_sources_changed(&self) -> Result<bool> {
+        let expected = {
+            let state = self.state.read().await;
+            let Some(index) = state.as_ref() else {
+                return Ok(false);
+            };
+            index.document_manifest.clone()
+        };
+        let documents = self
+            .manager
+            .scan_files_by_extensions(&["pdf", "docx"], self.config.document_max_bytes)?;
+        Ok(document_manifest_for(self.manager.vault_path(), &documents) != expected)
+    }
+
     /// Bring an out-of-date index current before answering, if it has fallen
     /// further behind than the configured threshold.
     ///
@@ -729,6 +930,11 @@ impl EmbeddingEngine {
         if self.config.refresh_after.is_zero() {
             return RefreshReport::default();
         }
+        let document_sources_changed = self.config.document_indexing_enabled
+            && self.document_sources_changed().await.unwrap_or(false);
+        if document_sources_changed {
+            let _ = self.mark_stale().await;
+        }
         let built_at = {
             let state = self.state.read().await;
             match state.as_ref() {
@@ -736,12 +942,14 @@ impl EmbeddingEngine {
                 Some(index) => index.built_at.clone(),
             }
         };
-        if !refresh_due(
-            self.stale.load(AtomicOrdering::Acquire),
-            Some(&built_at),
-            self.config.refresh_after,
-            Utc::now(),
-        ) {
+        if !document_sources_changed
+            && !refresh_due(
+                self.stale.load(AtomicOrdering::Acquire),
+                Some(&built_at),
+                self.config.refresh_after,
+                Utc::now(),
+            )
+        {
             return RefreshReport::default();
         }
         if let Ok(last) = self.last_refresh_attempt.lock()
@@ -758,10 +966,14 @@ impl EmbeddingEngine {
         if let Ok(mut last) = self.last_refresh_attempt.lock() {
             *last = Some(Instant::now());
         }
-        log::info!(
-            "embedding index is out of date and older than {:?}; refreshing before search",
-            self.config.refresh_after
-        );
+        if document_sources_changed {
+            log::info!("PDF or DOCX attachments changed; refreshing the embedding index");
+        } else {
+            log::info!(
+                "embedding index is out of date and older than {:?}; refreshing before search",
+                self.config.refresh_after
+            );
+        }
         match self.reindex().await {
             Ok(status) => {
                 log::info!("lazy index refresh complete: {} chunks", status.chunks);
@@ -965,12 +1177,16 @@ impl EmbeddingEngine {
                 model: &self.config.reranker_model,
                 query,
                 documents: chunk,
+                // TurboVault requires one score per submitted candidate. This
+                // is explicit for hosted routers whose default may return only
+                // a top subset.
+                top_n: chunk.len(),
             };
             let mut builder = self
                 .client
                 .post(&self.config.reranker_endpoint)
                 .json(&request);
-            if let Some(api_key) = &self.config.api_key {
+            if let Some(api_key) = &self.config.reranker_api_key {
                 builder = builder.bearer_auth(api_key);
             }
             let response = builder.send().await.map_err(|error| {
@@ -1052,120 +1268,496 @@ struct PendingChunk {
     content_hash: String,
 }
 
+fn document_manifest_for(vault_path: &Path, documents: &[ScannedNote]) -> Vec<DocumentStamp> {
+    let mut manifest = documents
+        .iter()
+        .map(|document| DocumentStamp {
+            path: document
+                .path
+                .strip_prefix(vault_path)
+                .unwrap_or(&document.path)
+                .to_string_lossy()
+                .to_string(),
+            size_bytes: document.size_bytes,
+            modified_millis: document.modified.and_then(system_time_millis),
+        })
+        .collect::<Vec<_>>();
+    manifest.sort_by(|left, right| left.path.cmp(&right.path));
+    manifest
+}
+
+fn system_time_millis(value: SystemTime) -> Option<u64> {
+    value
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn queue_text_chunks(
+    pending: &mut Vec<PendingChunk>,
+    path: &str,
+    title: &str,
+    source_type: &str,
+    markdown: &str,
+    content_hash: &str,
+    chunk_chars: usize,
+    chunk_overlap: usize,
+) {
+    for (chunk_number, chunk) in chunk_markdown(markdown, title, chunk_chars, chunk_overlap)
+        .into_iter()
+        .enumerate()
+    {
+        let plain = to_plain_text(&chunk.markdown);
+        if plain.trim().is_empty() {
+            continue;
+        }
+        let heading_prefix = chunk
+            .heading
+            .as_deref()
+            .map(|heading| format!("Section: {heading}\n"))
+            .unwrap_or_default();
+        let input = format!(
+            "Title: {title}\nType: {source_type}\n{heading_prefix}Path: {path}\nContent:\n{plain}"
+        );
+        pending.push(PendingChunk {
+            id: format!("{path}#{chunk_number}"),
+            path: path.to_string(),
+            title: title.to_string(),
+            heading: chunk.heading,
+            text: plain,
+            input,
+            content_hash: content_hash.to_string(),
+        });
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HeadingFrame {
+    level: usize,
+    text: String,
+}
+
 #[derive(Debug)]
 struct ChunkText {
     heading: Option<String>,
     markdown: String,
 }
 
-fn chunk_markdown(markdown: &str, max_chars: usize, overlap: usize) -> Vec<ChunkText> {
-    let mut paragraphs: Vec<(Option<String>, String)> = Vec::new();
-    let mut heading: Option<String> = None;
-    let mut paragraph = String::new();
+#[derive(Debug)]
+struct SectionNode {
+    parent: Option<usize>,
+    heading: Option<HeadingFrame>,
+    blocks: Vec<String>,
+    children: Vec<usize>,
+}
 
-    let mut flush_paragraph = |paragraph: &mut String, heading: &Option<String>| {
-        let text = paragraph.trim();
-        if !text.is_empty() {
-            paragraphs.push((heading.clone(), text.to_string()));
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OpenFence {
+    delimiter: char,
+    length: usize,
+}
+
+/// Build context-aware chunks from a Markdown heading tree.
+///
+/// Root-level sections are retrieval boundaries. Descendant subsections stay
+/// with their parent while the whole subtree fits; only an oversized subtree is
+/// split recursively at child headings. This avoids turning every short H3/H4
+/// subsection into a context-poor vector while still preventing a long,
+/// multi-topic note from collapsing into one averaged embedding.
+fn chunk_markdown(markdown: &str, title: &str, max_chars: usize, overlap: usize) -> Vec<ChunkText> {
+    let normalized = markdown.replace("\r\n", "\n").replace('\r', "\n");
+    let nodes = parse_section_tree(&normalized);
+    let mut chunks = Vec::new();
+
+    if !nodes[0].blocks.is_empty() {
+        chunks.extend(pack_blocks(&nodes[0].blocks, None, max_chars, overlap));
+    }
+
+    let mut top_level = nodes[0].children.clone();
+    let mut inherited = Vec::new();
+    if top_level.len() == 1 {
+        let wrapper = top_level[0];
+        let is_title_wrapper = nodes[wrapper].heading.as_ref().is_some_and(|heading| {
+            heading.level == 1
+                && normalize_heading(&heading.text) == normalize_heading(title)
+                && nodes[0].blocks.is_empty()
+                && !nodes[wrapper].children.is_empty()
+        });
+        if is_title_wrapper {
+            inherited.push(nodes[wrapper].heading.clone().expect("checked above"));
+            if !nodes[wrapper].blocks.is_empty() {
+                chunks.extend(pack_blocks(
+                    &nodes[wrapper].blocks,
+                    Some(format_breadcrumb(&inherited)),
+                    max_chars,
+                    overlap,
+                ));
+            }
+            top_level = nodes[wrapper].children.clone();
         }
-        paragraph.clear();
+    }
+
+    for node_id in top_level {
+        emit_section_chunks(&nodes, node_id, &inherited, max_chars, overlap, &mut chunks);
+    }
+
+    if chunks.is_empty() && !normalized.trim().is_empty() {
+        chunks.extend(pack_blocks(
+            &[normalized.trim().to_string()],
+            None,
+            max_chars,
+            overlap,
+        ));
+    }
+    chunks
+}
+
+fn parse_section_tree(markdown: &str) -> Vec<SectionNode> {
+    let mut nodes = vec![SectionNode {
+        parent: None,
+        heading: None,
+        blocks: Vec::new(),
+        children: Vec::new(),
+    }];
+    let mut current = 0usize;
+    let mut buffer = Vec::new();
+    let mut fence = None;
+
+    let flush = |nodes: &mut Vec<SectionNode>, current: usize, buffer: &mut Vec<String>| {
+        let text = buffer.join("\n").trim().to_string();
+        buffer.clear();
+        if !text.is_empty() {
+            nodes[current].blocks.push(text);
+        }
     };
 
     for line in markdown.lines() {
-        if let Some(next_heading) = parse_heading(line) {
-            flush_paragraph(&mut paragraph, &heading);
-            heading = Some(next_heading);
+        let next_fence = next_fence_state(line, fence);
+        if fence.is_some() || next_fence != fence {
+            buffer.push(line.to_string());
+            fence = next_fence;
             continue;
         }
-        if line.trim().is_empty() {
-            flush_paragraph(&mut paragraph, &heading);
-        } else {
-            if !paragraph.is_empty() {
-                paragraph.push('\n');
-            }
-            paragraph.push_str(line);
-        }
-    }
-    flush_paragraph(&mut paragraph, &heading);
 
-    let mut chunks = Vec::new();
-    let mut current_heading: Option<String> = None;
-    let mut current = String::new();
-    for (paragraph_heading, text) in paragraphs {
-        if current_heading != paragraph_heading && !current.trim().is_empty() {
-            chunks.push(ChunkText {
-                heading: current_heading.take(),
-                markdown: current.trim().to_string(),
-            });
-            current.clear();
-        }
-        current_heading = paragraph_heading.clone();
-        let candidate = if current.is_empty() {
-            text.clone()
-        } else {
-            format!("{current}\n\n{text}")
-        };
-        if candidate.chars().count() <= max_chars || current.is_empty() {
-            current = candidate;
-            if current.chars().count() <= max_chars {
-                continue;
+        if let Some(heading) = parse_heading(line) {
+            flush(&mut nodes, current, &mut buffer);
+            while current != 0
+                && nodes[current]
+                    .heading
+                    .as_ref()
+                    .is_some_and(|active| active.level >= heading.level)
+            {
+                current = nodes[current].parent.expect("non-root section has parent");
             }
-        }
-        chunks.push(ChunkText {
-            heading: current_heading.clone(),
-            markdown: current.chars().take(max_chars).collect(),
-        });
-        let tail: String = current
-            .chars()
-            .rev()
-            .take(overlap)
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect();
-        current = format!("{tail}\n\n{text}");
-        while current.chars().count() > max_chars {
-            chunks.push(ChunkText {
-                heading: current_heading.clone(),
-                markdown: current.chars().take(max_chars).collect(),
+            let node_id = nodes.len();
+            nodes.push(SectionNode {
+                parent: Some(current),
+                heading: Some(heading),
+                blocks: Vec::new(),
+                children: Vec::new(),
             });
-            let tail: String = current
-                .chars()
-                .rev()
-                .take(overlap)
-                .collect::<String>()
-                .chars()
-                .rev()
-                .collect();
-            current = tail;
+            nodes[current].children.push(node_id);
+            current = node_id;
+        } else if line.trim().is_empty() {
+            flush(&mut nodes, current, &mut buffer);
+        } else {
+            buffer.push(line.to_string());
         }
     }
-    if !current.trim().is_empty() {
+    flush(&mut nodes, current, &mut buffer);
+    nodes
+}
+
+fn emit_section_chunks(
+    nodes: &[SectionNode],
+    node_id: usize,
+    ancestors: &[HeadingFrame],
+    max_chars: usize,
+    overlap: usize,
+    chunks: &mut Vec<ChunkText>,
+) {
+    let node = &nodes[node_id];
+    let mut breadcrumb = ancestors.to_vec();
+    if let Some(heading) = &node.heading {
+        breadcrumb.push(heading.clone());
+    }
+    let label = Some(format_breadcrumb(&breadcrumb));
+    let whole = render_subtree(nodes, node_id);
+    if whole.chars().count() <= max_chars {
         chunks.push(ChunkText {
-            heading: current_heading,
-            markdown: current.trim().to_string(),
+            heading: label,
+            markdown: whole,
+        });
+        return;
+    }
+
+    if !node.blocks.is_empty() {
+        chunks.extend(pack_blocks(&node.blocks, label.clone(), max_chars, overlap));
+    }
+
+    let mut grouped_children = Vec::new();
+    let mut grouped_text = String::new();
+    let flush_group = |grouped_children: &mut Vec<usize>,
+                       grouped_text: &mut String,
+                       chunks: &mut Vec<ChunkText>| {
+        if !grouped_children.is_empty() {
+            let group_heading = if grouped_children.len() == 1 {
+                let mut child_breadcrumb = breadcrumb.clone();
+                if let Some(heading) = &nodes[grouped_children[0]].heading {
+                    child_breadcrumb.push(heading.clone());
+                }
+                Some(format_breadcrumb(&child_breadcrumb))
+            } else {
+                label.clone()
+            };
+            chunks.push(ChunkText {
+                heading: group_heading,
+                markdown: std::mem::take(grouped_text),
+            });
+            grouped_children.clear();
+        }
+    };
+
+    for &child_id in &node.children {
+        let child_text = render_subtree(nodes, child_id);
+        if child_text.chars().count() > max_chars {
+            flush_group(&mut grouped_children, &mut grouped_text, chunks);
+            emit_section_chunks(nodes, child_id, &breadcrumb, max_chars, overlap, chunks);
+            continue;
+        }
+        let candidate = if grouped_text.is_empty() {
+            child_text.clone()
+        } else {
+            format!("{grouped_text}\n\n{child_text}")
+        };
+        if candidate.chars().count() > max_chars {
+            flush_group(&mut grouped_children, &mut grouped_text, chunks);
+            grouped_text = child_text;
+        } else {
+            grouped_text = candidate;
+        }
+        grouped_children.push(child_id);
+    }
+    flush_group(&mut grouped_children, &mut grouped_text, chunks);
+}
+
+fn render_subtree(nodes: &[SectionNode], node_id: usize) -> String {
+    let node = &nodes[node_id];
+    let mut parts = Vec::new();
+    if let Some(heading) = &node.heading {
+        parts.push(format!("{} {}", "#".repeat(heading.level), heading.text));
+    }
+    parts.extend(node.blocks.iter().cloned());
+    parts.extend(
+        node.children
+            .iter()
+            .map(|&child_id| render_subtree(nodes, child_id)),
+    );
+    parts
+        .into_iter()
+        .filter(|part| !part.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn pack_blocks(
+    blocks: &[String],
+    heading: Option<String>,
+    max_chars: usize,
+    overlap: usize,
+) -> Vec<ChunkText> {
+    let units: Vec<String> = blocks
+        .iter()
+        .flat_map(|block| split_oversized_block(block, max_chars))
+        .collect();
+    let mut chunks = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+
+    for unit in units {
+        let candidate = if current.is_empty() {
+            unit.clone()
+        } else {
+            format!("{}\n\n{unit}", current.join("\n\n"))
+        };
+        if candidate.chars().count() <= max_chars {
+            current.push(unit);
+            continue;
+        }
+
+        if !current.is_empty() {
+            chunks.push(ChunkText {
+                heading: heading.clone(),
+                markdown: current.join("\n\n"),
+            });
+        }
+        let mut carry = trailing_whole_blocks(&current, overlap);
+        let with_carry = if carry.is_empty() {
+            unit.clone()
+        } else {
+            format!("{}\n\n{unit}", carry.join("\n\n"))
+        };
+        if with_carry.chars().count() > max_chars {
+            carry.clear();
+        }
+        carry.push(unit);
+        current = carry;
+    }
+
+    if !current.is_empty() {
+        chunks.push(ChunkText {
+            heading,
+            markdown: current.join("\n\n"),
         });
     }
     chunks
 }
 
-fn parse_heading(line: &str) -> Option<String> {
+fn trailing_whole_blocks(blocks: &[String], overlap: usize) -> Vec<String> {
+    if overlap == 0 || blocks.len() < 2 {
+        return Vec::new();
+    }
+    let mut selected = Vec::new();
+    let mut chars = 0usize;
+    for block in blocks.iter().rev() {
+        let block_chars = block.chars().count();
+        let separator = usize::from(!selected.is_empty()) * 2;
+        if chars + separator + block_chars > overlap {
+            break;
+        }
+        selected.push(block.clone());
+        chars += separator + block_chars;
+    }
+    selected.reverse();
+    selected
+}
+
+fn split_oversized_block(block: &str, max_chars: usize) -> Vec<String> {
+    if block.chars().count() <= max_chars {
+        return vec![block.to_string()];
+    }
+    for separator in ['\n', '.', '!', '?'] {
+        let pieces = split_and_pack(block, separator, max_chars);
+        if pieces.len() > 1
+            && pieces
+                .iter()
+                .all(|piece| piece.chars().count() <= max_chars)
+        {
+            return pieces;
+        }
+    }
+    let chars: Vec<char> = block.chars().collect();
+    chars
+        .chunks(max_chars.max(1))
+        .map(|chunk| chunk.iter().collect())
+        .collect()
+}
+
+fn split_and_pack(text: &str, separator: char, max_chars: usize) -> Vec<String> {
+    let raw_parts: Vec<String> = if separator == '\n' {
+        text.split('\n').map(ToString::to_string).collect()
+    } else {
+        text.split_inclusive(separator)
+            .map(|part| part.trim().to_string())
+            .filter(|part| !part.is_empty())
+            .collect()
+    };
+    if raw_parts.len() < 2 {
+        return vec![text.to_string()];
+    }
+    let joiner = if separator == '\n' { "\n" } else { " " };
+    let mut packed = Vec::new();
+    let mut current = String::new();
+    for part in raw_parts {
+        if part.chars().count() > max_chars {
+            return vec![text.to_string()];
+        }
+        let candidate = if current.is_empty() {
+            part.clone()
+        } else {
+            format!("{current}{joiner}{part}")
+        };
+        if candidate.chars().count() <= max_chars {
+            current = candidate;
+        } else {
+            packed.push(std::mem::take(&mut current));
+            current = part;
+        }
+    }
+    if !current.is_empty() {
+        packed.push(current);
+    }
+    packed
+}
+
+fn parse_heading(line: &str) -> Option<HeadingFrame> {
     let trimmed = line.trim_start();
+    if line.len().saturating_sub(trimmed.len()) > 3 {
+        return None;
+    }
     let hashes = trimmed
         .chars()
         .take_while(|character| *character == '#')
         .count();
     if (1..=6).contains(&hashes) && trimmed.chars().nth(hashes) == Some(' ') {
-        Some(
-            trimmed[hashes..]
+        Some(HeadingFrame {
+            level: hashes,
+            text: trimmed[hashes..]
                 .trim()
                 .trim_end_matches('#')
                 .trim()
                 .to_string(),
-        )
+        })
     } else {
         None
     }
+}
+
+fn next_fence_state(line: &str, open: Option<OpenFence>) -> Option<OpenFence> {
+    let trimmed = line.trim_start();
+    if line.len().saturating_sub(trimmed.len()) > 3 {
+        return open;
+    }
+    let delimiter = trimmed.chars().next()?;
+    if delimiter != '`' && delimiter != '~' {
+        return open;
+    }
+    let length = trimmed
+        .chars()
+        .take_while(|character| *character == delimiter)
+        .count();
+    if length < 3 {
+        return open;
+    }
+    let trailing = trimmed.chars().skip(length).collect::<String>();
+    match open {
+        None if delimiter == '`' && trailing.contains('`') => None,
+        None => Some(OpenFence { delimiter, length }),
+        Some(active)
+            if active.delimiter == delimiter
+                && length >= active.length
+                && trailing.trim().is_empty() =>
+        {
+            None
+        }
+        Some(active) => Some(active),
+    }
+}
+
+fn format_breadcrumb(headings: &[HeadingFrame]) -> String {
+    headings
+        .iter()
+        .map(|heading| heading.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" > ")
+}
+
+fn normalize_heading(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 fn hex_hash(bytes: &[u8]) -> String {
@@ -1197,6 +1789,15 @@ fn cosine_similarity(left: &[f32], right: &[f32]) -> f64 {
 
 fn truncate_for_error(body: &str) -> String {
     body.chars().take(500).collect()
+}
+
+fn is_document_path(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("pdf") || extension.eq_ignore_ascii_case("docx")
+        })
 }
 
 fn is_path_excluded(path: &str) -> bool {
@@ -1285,15 +1886,72 @@ mod tests {
     use super::*;
 
     #[test]
-    fn heading_chunker_preserves_sections_and_overlap() {
+    fn chunker_keeps_subsections_with_parent_when_they_fit() {
         let chunks = chunk_markdown(
-            "# One\n\nalpha beta gamma\n\n## Two\n\ndelta epsilon zeta",
-            40,
-            5,
+            "# One\n\nintro\n\n## Two\n\ndetails\n\n### Three\n\nmore details",
+            "Different title",
+            200,
+            20,
+        );
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].heading.as_deref(), Some("One"));
+        assert!(chunks[0].markdown.contains("## Two"));
+        assert!(chunks[0].markdown.contains("### Three"));
+    }
+
+    #[test]
+    fn chunker_splits_root_sections_but_not_their_small_subsections() {
+        let chunks = chunk_markdown(
+            "# One\n\nalpha\n\n## Detail\n\nbeta\n\n# Two\n\ngamma\n\n## Detail\n\ndelta",
+            "Note",
+            200,
+            20,
         );
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].heading.as_deref(), Some("One"));
         assert_eq!(chunks[1].heading.as_deref(), Some("Two"));
+        assert!(chunks[0].markdown.contains("## Detail"));
+        assert!(chunks[1].markdown.contains("## Detail"));
+    }
+
+    #[test]
+    fn matching_h1_title_is_a_wrapper_not_one_giant_section() {
+        let chunks = chunk_markdown(
+            "# My Note\n\n## One\n\nalpha\n\n## Two\n\nbeta",
+            "My Note",
+            200,
+            20,
+        );
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].heading.as_deref(), Some("My Note > One"));
+        assert_eq!(chunks[1].heading.as_deref(), Some("My Note > Two"));
+    }
+
+    #[test]
+    fn heading_inside_fenced_code_does_not_split_the_section() {
+        let chunks = chunk_markdown(
+            "# One\n\n```sh\n# not a heading\necho test\n```\n\n## Two\n\ntext",
+            "Note",
+            200,
+            20,
+        );
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].heading.as_deref(), Some("One"));
+        assert!(chunks[0].markdown.contains("# not a heading"));
+        assert!(chunks[0].markdown.contains("## Two"));
+    }
+
+    #[test]
+    fn oversized_subtree_splits_recursively_at_child_sections() {
+        let chunks = chunk_markdown(
+            "# One\n\n## Alpha\n\n12345678901234567890\n\n## Beta\n\nabcdefghijklmnopqrst",
+            "Note",
+            35,
+            0,
+        );
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].heading.as_deref(), Some("One > Alpha"));
+        assert_eq!(chunks[1].heading.as_deref(), Some("One > Beta"));
     }
 
     fn stored_index(model: &str, vault_path: &str) -> StoredIndex {
@@ -1304,6 +1962,9 @@ mod tests {
             vault_path: vault_path.to_string(),
             dimension: 4096,
             built_at: "2026-01-01T00:00:00Z".to_string(),
+            document_indexing_enabled: false,
+            document_max_bytes: DEFAULT_DOCUMENT_MAX_BYTES as u64,
+            document_manifest: Vec::new(),
             chunks: Vec::new(),
         }
     }
@@ -1321,24 +1982,76 @@ mod tests {
         // a vault write to invalidate here. This is the property that makes
         // `search` serve an out-of-date index rather than refusing it.
         assert_eq!(
-            index_mismatch(&index, "Qwen/Qwen3-Embedding-8B-GGUF", vault),
+            index_mismatch(
+                &index,
+                "Qwen/Qwen3-Embedding-8B-GGUF",
+                vault,
+                false,
+                DEFAULT_DOCUMENT_MAX_BYTES as u64,
+            ),
             None
         );
 
         // A different embedding model produces vectors in a different space.
         assert!(
-            index_mismatch(&index, "BAAI/bge-m3", vault).is_some(),
+            index_mismatch(
+                &index,
+                "BAAI/bge-m3",
+                vault,
+                false,
+                DEFAULT_DOCUMENT_MAX_BYTES as u64,
+            )
+            .is_some(),
             "a model change must refuse: cosine similarity across spaces is meaningless"
         );
-        assert!(index_mismatch(&index, "Qwen/Qwen3-Embedding-8B-GGUF", "/other/vault").is_some());
+        assert!(
+            index_mismatch(
+                &index,
+                "Qwen/Qwen3-Embedding-8B-GGUF",
+                "/other/vault",
+                false,
+                DEFAULT_DOCUMENT_MAX_BYTES as u64,
+            )
+            .is_some()
+        );
 
         let mut reschemaed = stored_index("Qwen/Qwen3-Embedding-8B-GGUF", vault);
         reschemaed.schema_version = INDEX_SCHEMA_VERSION + 1;
-        assert!(index_mismatch(&reschemaed, "Qwen/Qwen3-Embedding-8B-GGUF", vault).is_some());
+        assert!(
+            index_mismatch(
+                &reschemaed,
+                "Qwen/Qwen3-Embedding-8B-GGUF",
+                vault,
+                false,
+                DEFAULT_DOCUMENT_MAX_BYTES as u64,
+            )
+            .is_some()
+        );
 
         let mut rechunked = stored_index("Qwen/Qwen3-Embedding-8B-GGUF", vault);
         rechunked.chunker_version = "markdown-heading-v2".to_string();
-        assert!(index_mismatch(&rechunked, "Qwen/Qwen3-Embedding-8B-GGUF", vault).is_some());
+        assert!(
+            index_mismatch(
+                &rechunked,
+                "Qwen/Qwen3-Embedding-8B-GGUF",
+                vault,
+                false,
+                DEFAULT_DOCUMENT_MAX_BYTES as u64,
+            )
+            .is_some()
+        );
+
+        assert!(
+            index_mismatch(
+                &index,
+                "Qwen/Qwen3-Embedding-8B-GGUF",
+                vault,
+                true,
+                DEFAULT_DOCUMENT_MAX_BYTES as u64,
+            )
+            .is_some(),
+            "enabling document indexing changes the indexed source set"
+        );
     }
 
     fn at(offset_hours: i64) -> DateTime<Utc> {
@@ -1425,6 +2138,35 @@ mod tests {
     }
 
     #[test]
+    fn document_manifest_is_sorted_and_preserves_fingerprints() {
+        let vault = Path::new("/vault");
+        let documents = vec![
+            ScannedNote {
+                path: PathBuf::from("/vault/z.docx"),
+                size_bytes: 20,
+                modified: Some(SystemTime::UNIX_EPOCH + Duration::from_millis(9)),
+            },
+            ScannedNote {
+                path: PathBuf::from("/vault/a.pdf"),
+                size_bytes: 10,
+                modified: Some(SystemTime::UNIX_EPOCH + Duration::from_millis(4)),
+            },
+        ];
+        let manifest = document_manifest_for(vault, &documents);
+        assert_eq!(manifest[0].path, "a.pdf");
+        assert_eq!(manifest[0].size_bytes, 10);
+        assert_eq!(manifest[0].modified_millis, Some(4));
+        assert_eq!(manifest[1].path, "z.docx");
+    }
+
+    #[test]
+    fn document_paths_are_detected_case_insensitively() {
+        assert!(is_document_path("attachments/paper.PDF"));
+        assert!(is_document_path("attachments/draft.docx"));
+        assert!(!is_document_path("notes/paper.md"));
+    }
+
+    #[test]
     fn path_exclusion_detects_trash_and_obsidian() {
         assert!(is_path_excluded(".trash/note.md"));
         assert!(is_path_excluded("folder/.trash/note.md"));
@@ -1450,6 +2192,40 @@ mod tests {
 
         let expected = (1.0 / 61.0) + (1.0 / 62.0);
         assert!((entry.rrf_score - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rerank_request_asks_for_every_candidate() {
+        let documents = vec!["first".to_string(), "second".to_string()];
+        let request = RerankRequest {
+            model: "cohere/rerank-v3.5",
+            query: "test query",
+            documents: &documents,
+            top_n: documents.len(),
+        };
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "model": "cohere/rerank-v3.5",
+                "query": "test query",
+                "documents": ["first", "second"],
+                "top_n": 2
+            })
+        );
+    }
+
+    #[test]
+    fn dedicated_reranker_key_overrides_shared_embedding_key() {
+        let shared = "shared".to_string();
+        assert_eq!(
+            select_reranker_api_key(Some("dedicated".to_string()), Some(&shared)).as_deref(),
+            Some("dedicated")
+        );
+        assert_eq!(
+            select_reranker_api_key(None, Some(&shared)).as_deref(),
+            Some("shared")
+        );
+        assert_eq!(select_reranker_api_key(None, None), None);
     }
 
     #[test]

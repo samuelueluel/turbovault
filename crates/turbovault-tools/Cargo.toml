@@ -49,6 +49,9 @@ regex = { workspace = true }
 # Tier 1d: Production-grade full-text search
 tantivy = { workspace = true }
 reqwest = { workspace = true }
+pdf-extract = { workspace = true }
+quick-xml = { workspace = true }
+zip = { workspace = true }
 sha2 = { workspace = true }
 
 # Optional: SQL query engine for frontmatter queries

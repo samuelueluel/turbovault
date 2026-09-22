@@ -9,10 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Optional dense and hybrid vault retrieval**: heading-aware Markdown chunks can be embedded through an OpenAI-compatible endpoint and persisted outside the vault. New `embedding_search`, `hybrid_search`, `reindex_embeddings`, and `embedding_index_status` tools add paraphrase-aware RAG without changing the existing sparse search, TF-IDF similarity, filters, graph, SQL, or mutation tools.
-- **Stale-index protection**: vault mutations mark the derived embedding index stale and dense tools fail closed until an explicit `reindex_embeddings` rebuild.
+- **Optional dense and hybrid vault retrieval**: hierarchical Markdown chunks can be embedded through a configurable local or hosted OpenAI-compatible endpoint and persisted outside the vault. `semantic_search` fuses BM25 and dense candidates and optionally reranks them, while `reindex_embeddings` and `embedding_index_status` manage the derived index without changing lexical search, filters, graph, SQL, or mutation tools.
+- **Context-preserving Markdown chunking**: top-level sections remain retrieval boundaries while smaller descendant subsections stay together when they fit. Oversized subtrees split recursively at child headings, then at complete blocks and sentences. Every embedding input carries the title, path, and heading breadcrumb; fenced-code headings do not create false sections.
+- **Optional PDF and DOCX attachment indexing**: `TURBOVAULT_DOCUMENT_INDEXING_ENABLED=true` extracts text-layer PDFs page-by-page and DOCX paragraphs with Word heading styles, then runs them through the same hierarchical chunker. Raw file hashes reuse unchanged vectors, file fingerprints detect external changes, and index status reports discovered files, successfully indexed files, and attachment chunk counts. Scanned PDFs and legacy `.doc` files remain unsupported.
+- **Optional OpenRouter inference**: documented configurations can route embeddings and reranking through OpenRouter without replacing the local endpoint defaults. A dedicated `TURBOVAULT_RERANKER_API_KEY` may override the embedding key; otherwise one provider key can authenticate both requests.
+- **Windows embedding cache default**: dense indexes use `%LOCALAPPDATA%\turbovault\embeddings` when `TURBOVAULT_EMBEDDING_INDEX_DIR` is not set.
+- **Windows release smoke test**: the cross-platform release workflow launches the built MSVC executable with `--version` before packaging it.
 
 ### Fixed
+
+- **Hosted rerankers receive an explicit result count:** rerank requests now set `top_n` to the submitted batch size, so providers such as OpenRouter return the one score per candidate that TurboVault requires.
 
 - **Numeric tool schemas are portable across MCP clients:** `schemars` emitted Rust-only numeric `format` annotations (`uint`, `uint8`, `uint64`, `int32`, and `double`) in `tools/list`. AJV-based clients warned about each annotation and could leak those warnings into their terminal UI. Advertised schemas now retain their JSON types and bounds while omitting the non-portable numeric annotations.
 
@@ -21,6 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   1.6.0 flattened these the same way. It also hoisted a copy of the image out of the quote as a top-level sibling, so anything scanning top-level blocks still found a source, which is why 2.0.0 looked like a regression: it correctly stopped hoisting, and that removed the thing masking the loss.
 
 ### Changed
+
+- **Dense index schema and chunker version advanced.** Existing embedding indexes must be rebuilt once. An older binary index now leaves the embedding tools available and reports an incompatible index instead of preventing `reindex_embeddings` from opening.
 
 - **Off the yanked `chacha20`.** 0.10.0 and 0.10.1 are both yanked, so cargo warned on every package
   step while publishing 2.0.0. It arrives through `rand` under turbomcp's transport and protocol

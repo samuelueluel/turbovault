@@ -170,6 +170,7 @@ pub mod analysis_tools;
 pub mod audit_tools;
 pub mod batch_tools;
 pub mod diff_tools;
+mod document_extract;
 pub mod duplicate_tools;
 pub mod embedding_engine;
 pub mod export_tools;

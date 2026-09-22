@@ -2269,7 +2269,7 @@
     "annotations": {
       "readOnlyHint": true
     },
-    "description": "Search vault passages by semantic similarity using hybrid neural retrieval (BM25 + Qwen3 dense embeddings + cross-encoder reranking)",
+    "description": "Search Markdown, PDF, and DOCX passages by semantic similarity using hybrid neural retrieval (BM25 + configurable dense embeddings + optional cross-encoder reranking)",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
@@ -2304,7 +2304,7 @@
     "annotations": {
       "readOnlyHint": true
     },
-    "description": "Build or rebuild the versioned dense embedding index for the active vault",
+    "description": "Build or rebuild the versioned dense index from hierarchical Markdown chunks and optionally extracted PDF and DOCX text",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
@@ -2324,7 +2324,7 @@
     "annotations": {
       "readOnlyHint": true
     },
-    "description": "Report dense embedding index configuration, freshness, model, chunk count, and vector dimensions",
+    "description": "Report dense index configuration, freshness, model, chunk counts, dimensions, and PDF/DOCX extraction coverage",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,

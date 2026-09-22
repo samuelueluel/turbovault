@@ -53,7 +53,7 @@ TurboVault is a modular system composed of specialized crates. You can depend on
 Unlike basic note readers, TurboVault understands your vault's **knowledge structure**:
 
 - **Full-text search** across all notes with BM25 ranking
-- **Optional dense and hybrid RAG** using heading-aware chunks and an OpenAI-compatible embedding endpoint
+- **Optional dense and hybrid RAG** using hierarchical, context-preserving chunks and an OpenAI-compatible embedding endpoint
 - **Link graph analysis** to discover relationships, hubs, orphans, and cycles
 - **Vault intelligence** with health scoring and automated recommendations
 - **Validated operation batches** for fewer round trips and fail-fast execution
@@ -123,6 +123,29 @@ Then add to `~/.config/claude/claude_desktop_config.json`:
 }
 ```
 
+#### Windows stdio with Claude Code
+
+Windows releases include `turbovault-x86_64-pc-windows-msvc.exe.zip`. Extract the executable and add a local stdio server to Claude Code through `.mcp.json` or the equivalent user-scoped configuration:
+
+```json
+{
+  "mcpServers": {
+    "turbovault": {
+      "type": "stdio",
+      "command": "C:\\Tools\\TurboVault\\turbovault-x86_64-pc-windows-msvc.exe",
+      "args": [
+        "--vault",
+        "C:\\Users\\me\\Documents\\ObsidianVault",
+        "--profile",
+        "production"
+      ]
+    }
+  }
+}
+```
+
+Run `claude mcp list` or open `/mcp` to verify the connection. The Windows binary uses the same JSON-lines stdio protocol as Linux and macOS.
+
 ### Option 2: Runtime Vault Addition (Recommended for Multiple Vaults)
 
 Start the server without a vault:
@@ -159,16 +182,49 @@ Claude: [Uses get_hub_notes() to find key concepts]
 
 ### Optional Dense and Hybrid RAG
 
-TurboVault keeps exact sparse search as the default and adds dense retrieval as an opt-in derived index. Configure an OpenAI-compatible embedding endpoint, normally the local Qwen3 service used by Samuel's Zotero MCP fork:
+TurboVault keeps BM25 sparse search available without any model service. Dense retrieval and cross-encoder reranking are optional, independently configurable additions. Their endpoints may run locally or in the cloud; hosted inference is never forced.
+
+#### Local endpoints
+
+The built-in defaults target local services on ports 8082 and 8083. Set the variables explicitly when the endpoint or model differs:
 
 ```bash
 export TURBOVAULT_EMBEDDING_ENDPOINT=http://127.0.0.1:8082/v1/embeddings
 export TURBOVAULT_EMBEDDING_MODEL=Qwen/Qwen3-Embedding-8B-GGUF
-# Optional: only needed for an authenticated endpoint
-export TURBOVAULT_EMBEDDING_API_KEY=...
+export TURBOVAULT_RERANKER_ENDPOINT=http://127.0.0.1:8083/v1/rerank
+export TURBOVAULT_RERANKER_MODEL=BAAI/bge-reranker-v2-m3
 ```
 
-The index is stored outside the vault and is versioned by vault path, model, and chunker. After connecting an MCP client, run `embedding_index_status()`, then `reindex_embeddings()`. Use `embedding_search()` for conceptual retrieval and `hybrid_search()` for the normal RAG route combining sparse exact matches with dense paraphrase matches. Vault mutations mark the derived index stale; regular `search()` continues to work while the dense index is rebuilt.
+#### Optional OpenRouter endpoints
+
+OpenRouter exposes compatible embedding and rerank APIs. Selecting these values sends note chunks, queries, and reranking candidates to OpenRouter and its routed providers:
+
+```bash
+export TURBOVAULT_EMBEDDING_ENDPOINT=https://openrouter.ai/api/v1/embeddings
+export TURBOVAULT_EMBEDDING_MODEL=openai/text-embedding-3-small
+export TURBOVAULT_EMBEDDING_API_KEY="$OPENROUTER_API_KEY"
+
+# Optional second stage. Dense + BM25 retrieval still works when this is false.
+export TURBOVAULT_RERANKER_ENABLED=true
+export TURBOVAULT_RERANKER_ENDPOINT=https://openrouter.ai/api/v1/rerank
+export TURBOVAULT_RERANKER_MODEL=cohere/rerank-v3.5
+```
+
+The reranker reuses `TURBOVAULT_EMBEDDING_API_KEY` by default. Set `TURBOVAULT_RERANKER_API_KEY` only when reranking uses a different credential or provider. Set `TURBOVAULT_RERANKER_ENABLED=false` to keep hybrid BM25 plus dense retrieval without sending candidates to a reranker.
+
+#### Hierarchical chunking
+
+Markdown is split by structure rather than by a fixed character window alone. Each top-level content section remains a retrieval boundary, but its smaller subsections stay in the same chunk when the full subtree fits. Oversized sections split recursively at child headings, then at complete Markdown blocks, sentences, and finally characters only as a last resort. Every embedding input includes the note title, path, and active heading breadcrumb. Headings inside fenced code blocks do not create false sections, and overlap reuses complete blocks rather than arbitrary character tails.
+
+#### Optional PDF and DOCX indexing
+
+Set `TURBOVAULT_DOCUMENT_INDEXING_ENABLED=true` to include text-layer PDFs and `.docx` files in the dense index. PDF page numbers and Word heading styles become chunk locators. Extraction runs locally without a model, and extracted text remains derived state outside the vault. `TURBOVAULT_DOCUMENT_MAX_BYTES` sets the per-file limit in bytes and defaults to 50 MiB.
+
+Scanned PDFs without a text layer are skipped because they require OCR; legacy `.doc` files are not supported. Attachment indexing affects dense retrieval only: lexical `search()` continues to search Markdown notes. When the embedding endpoint is hosted, extracted attachment text is sent to that provider just like Markdown chunks. Adding, editing, or removing an eligible attachment is detected from its file fingerprint and triggers an incremental refresh on the next semantic search.
+
+The vector index stays outside the vault. Its default root is `%LOCALAPPDATA%\turbovault\embeddings` on Windows and `$XDG_CACHE_HOME/turbovault/embeddings` or `~/.cache/turbovault/embeddings` elsewhere. Override it with `TURBOVAULT_EMBEDDING_INDEX_DIR`.
+
+After connecting an MCP client, call `embedding_index_status()` and then run `reindex_embeddings()` once. The chunker and index schema changed in this release, so an existing dense index must be rebuilt once. Use `semantic_search()` for conceptual retrieval; it fuses BM25 and dense candidates and applies reranking when enabled. Later refreshes reuse vectors for unchanged source hashes, and a failed endpoint degrades the affected channel rather than disabling lexical `search()`.
 
 ### Atomic Git-Backed Writes
 
@@ -277,8 +333,10 @@ Claude: suggest_links() -> get_link_strength() -> recommend cross-references
 - `inspect_frontmatter` — Schema inspection for SQL queries (feature: `sql`)
 - `query_frontmatter_sql` — Arbitrary SQL against frontmatter via GlueSQL (feature: `sql`)
 
-### Semantic & Similarity (5)
-- `semantic_search` — TF-IDF semantic search with similarity scores and shared terms
+### Semantic & Similarity (7)
+- `semantic_search` — Hybrid Markdown BM25 and dense retrieval across hierarchical note chunks plus enabled PDF/DOCX text, with optional cross-encoder reranking
+- `embedding_index_status` — Endpoint, model, compatibility, freshness, and attachment-extraction coverage
+- `reindex_embeddings` — Initial or explicit incremental build of the derived dense index
 - `find_similar_notes` — Content-similar notes to a given note
 - `find_duplicates` — Near-duplicate detection (SimHash filter + TF-IDF verify)
 - `compare_notes` — Similarity score, shared vocabulary, diff, and merge recommendation

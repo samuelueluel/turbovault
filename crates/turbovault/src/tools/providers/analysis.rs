@@ -473,8 +473,8 @@ impl AnalysisProvider {
     // ─── SEMANTIC & RETRIEVAL TOOLS ──────────────────────────────────
 
     #[tool(
-        description = "Search vault passages by semantic similarity using hybrid neural retrieval (BM25 + Qwen3 dense embeddings + cross-encoder reranking)",
-        usage = "Use as the primary semantic search route for conceptual questions, topics, and natural language descriptions. Fuses Tantivy sparse retrieval with dense embedding similarity, then re-scores top candidates with the local cross-encoder reranker",
+        description = "Search Markdown, PDF, and DOCX passages by semantic similarity using hybrid neural retrieval (BM25 + configurable dense embeddings + optional cross-encoder reranking)",
+        usage = "Use as the primary semantic search route for conceptual questions, topics, and natural language descriptions. Fuses Markdown BM25 retrieval with dense hierarchical chunks, including locally extracted PDF and DOCX text when attachment indexing is enabled, then optionally re-scores top candidates through the configured reranker endpoint",
         performance = "Moderate after indexing; executes sparse search, dense embedding query, and cross-encoder reranking",
         related = ["search", "advanced_search", "reindex_embeddings", "embedding_index_status", "read_note"],
         examples = ["semantic_search(query='mechanisms linking zoning restrictions to rent burdens')", "semantic_search(query='how to format Stata do-files consistently', limit=15)"],
@@ -538,9 +538,9 @@ impl AnalysisProvider {
     }
 
     #[tool(
-        description = "Build or rebuild the versioned dense embedding index for the active vault",
-        usage = "Run after configuring the local OpenAI-compatible embedding endpoint and after substantial vault changes. The index is stored outside the vault; writes to notes mark it stale and require another explicit reindex",
-        performance = "Slow on first build; processes heading-aware Markdown chunks in batches through the embedding endpoint",
+        description = "Build or rebuild the versioned dense index from hierarchical Markdown chunks and optionally extracted PDF and DOCX text",
+        usage = "Run once after configuring an OpenAI-compatible local or hosted embedding endpoint, after changing the model or chunker, or after enabling document indexing. The index is stored outside the vault; source hashes reuse unchanged vectors and lazy refresh detects later note and attachment changes",
+        performance = "Slow on first build; extracts enabled documents locally, then embeds context-preserving chunks in batches through the configured endpoint",
         related = ["embedding_index_status", "semantic_search", "search"],
         examples = ["reindex_embeddings()"],
         tags = ["read", "search", "maintenance", "embeddings"],
@@ -562,8 +562,8 @@ impl AnalysisProvider {
     }
 
     #[tool(
-        description = "Report dense embedding index configuration, freshness, model, chunk count, and vector dimensions",
-        usage = "Use before dense or hybrid retrieval to confirm the configured endpoint is reachable through a completed index build and that the derived index is not stale",
+        description = "Report dense index configuration, freshness, model, chunk counts, dimensions, and PDF/DOCX extraction coverage",
+        usage = "Use before dense or hybrid retrieval to confirm a compatible index exists and inspect whether optional document sources were discovered and successfully indexed",
         performance = "Fast; reads in-memory index metadata",
         related = ["reindex_embeddings", "semantic_search", "search"],
         examples = ["embedding_index_status()"],

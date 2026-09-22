@@ -98,6 +98,9 @@ gluesql = { version = "0.19", default-features = false, features = ["gluesql_mem
 # Search and Matching (Tier 1d: Replace hand-rolled implementations)
 tantivy = "0.26"           # Full-text search engine (Apache Lucene-inspired, production-grade)
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] } # OpenAI-compatible local embedding endpoint
+pdf-extract = "0.12.1"   # Pure-Rust text-layer PDF extraction for attachment indexing
+quick-xml = "0.42"       # Streaming DOCX XML extraction
+zip = { version = "6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 # File Editing & Diff (World-class fuzzy matching for LLM-generated edits)
 similar = { version = "3.1", features = ["inline"] }  # mitsuhiko's diff lib (used by insta)

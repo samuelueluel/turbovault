@@ -247,7 +247,7 @@ impl Drop for WriteClaim<'_> {
 
 /// Everything a vault scan needs, detached from the manager once at
 /// construction so the walk can move to the blocking pool without borrowing it.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ScanSpec {
     root: PathBuf,
     excluded: HashSet<String>,
@@ -1760,6 +1760,26 @@ impl VaultManager {
         self.scan_files()
     }
 
+    /// Scan the vault for a caller-supplied set of file extensions.
+    ///
+    /// This reuses the vault's protected/excluded-directory policy but keeps the
+    /// caller's document types and size budget separate from note discovery.
+    /// It is intended for derived indexes that can extract text from binary
+    /// containers without making those attachments part of the note graph.
+    pub fn scan_files_by_extensions(
+        &self,
+        extensions: &[&str],
+        max_file_size: u64,
+    ) -> Result<Vec<ScannedNote>> {
+        let mut spec = (*self.scan_spec).clone();
+        spec.allowed_extensions = extensions
+            .iter()
+            .map(|extension| extension.trim_start_matches('.').to_ascii_lowercase())
+            .collect();
+        spec.max_file_size = max_file_size;
+        spec.walk()
+    }
+
     /// Return clones of all `VaultFile` objects currently in the in-memory cache.
     ///
     /// The cache is populated during `initialize()` and kept up-to-date on every
@@ -2820,6 +2840,29 @@ mod tests {
         let files = manager.scan_vault().await.unwrap();
         assert_eq!(files.len(), 1);
         assert!(files[0].ends_with("note.md"));
+    }
+
+    #[test]
+    fn test_custom_extension_scan_is_separate_and_size_bounded() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = create_test_config(temp_dir.path());
+        let manager = VaultManager::new(config).unwrap();
+
+        std::fs::write(temp_dir.path().join("paper.PDF"), b"small").unwrap();
+        std::fs::write(temp_dir.path().join("draft.docx"), b"0123456789").unwrap();
+        std::fs::write(temp_dir.path().join("note.md"), b"# Note").unwrap();
+        std::fs::create_dir_all(temp_dir.path().join(".obsidian")).unwrap();
+        std::fs::write(temp_dir.path().join(".obsidian/hidden.pdf"), b"small").unwrap();
+
+        let files = manager
+            .scan_files_by_extensions(&["pdf", "docx"], 6)
+            .unwrap();
+        assert_eq!(files.len(), 1);
+        assert!(files[0].path.ends_with("paper.PDF"));
+
+        let ordinary = manager.scan_files_by_extensions(&["md"], 6).unwrap();
+        assert_eq!(ordinary.len(), 1);
+        assert!(ordinary[0].path.ends_with("note.md"));
     }
 
     /// Extension matching is case-insensitive, because `sync_index`'s markdown

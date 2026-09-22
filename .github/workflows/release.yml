@@ -154,6 +154,15 @@ jobs:
           fi
         shell: bash
 
+      - name: Smoke test Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & "target/${{ matrix.target }}/release/turbovault.exe" --version
+          if ($LASTEXITCODE -ne 0) {
+            throw "Windows binary failed its launch smoke test"
+          }
+
       # macOS Code Signing (optional - requires secrets to be configured)
       - name: Import Apple Code Signing Certificate
         if: runner.os == 'macOS'
