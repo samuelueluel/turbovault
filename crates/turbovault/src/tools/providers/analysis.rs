@@ -550,7 +550,7 @@ impl AnalysisProvider {
         let start = std::time::Instant::now();
         let vault_name = self.get_active_vault_name().await?;
         let engine = self.get_embedding_engine().await?;
-        let status = engine.reindex().await.map_err(to_mcp_error)?;
+        let status = engine.start_reindex().await;
         StandardResponse::new(
             &vault_name,
             "reindex_embeddings",
