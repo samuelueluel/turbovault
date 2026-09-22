@@ -538,9 +538,9 @@ impl AnalysisProvider {
     }
 
     #[tool(
-        description = "Build or rebuild the versioned dense index from hierarchical Markdown chunks and optionally extracted PDF and DOCX text",
-        usage = "Run once after configuring an OpenAI-compatible local or hosted embedding endpoint, after changing the model or chunker, or after enabling document indexing. The index is stored outside the vault; source hashes reuse unchanged vectors and lazy refresh detects later note and attachment changes",
-        performance = "Slow on first build; extracts enabled documents locally, then embeds context-preserving chunks in batches through the configured endpoint",
+        description = "Start a background build or rebuild of the versioned dense index from hierarchical Markdown chunks and optional PDF/DOCX text",
+        usage = "Start once after configuring an OpenAI-compatible local or hosted embedding endpoint, changing the model or chunker, or enabling document indexing. Returns immediately; poll embedding_index_status until reindex_phase is complete or failed. The index is stored outside the vault and source hashes reuse unchanged vectors",
+        performance = "Returns immediately; the background job extracts enabled documents locally and embeds chunks in batches through the configured endpoint",
         related = ["embedding_index_status", "semantic_search", "search"],
         examples = ["reindex_embeddings()"],
         tags = ["read", "search", "maintenance", "embeddings"],

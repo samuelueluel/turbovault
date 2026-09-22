@@ -224,7 +224,7 @@ Scanned PDFs without a text layer are skipped because they require OCR; legacy `
 
 The vector index stays outside the vault. Its default root is `%LOCALAPPDATA%\turbovault\embeddings` on Windows and `$XDG_CACHE_HOME/turbovault/embeddings` or `~/.cache/turbovault/embeddings` elsewhere. Override it with `TURBOVAULT_EMBEDDING_INDEX_DIR`.
 
-After connecting an MCP client, call `embedding_index_status()` and then run `reindex_embeddings()` once. The chunker and index schema changed in this release, so an existing dense index must be rebuilt once. Use `semantic_search()` for conceptual retrieval; it fuses BM25 and dense candidates and applies reranking when enabled. Later refreshes reuse vectors for unchanged source hashes, and a failed endpoint degrades the affected channel rather than disabling lexical `search()`.
+After connecting an MCP client, call `embedding_index_status()` and then run `reindex_embeddings()` once. The command starts a background build and returns immediately; poll `embedding_index_status()` until `reindex_phase` is `complete` or `failed`. The chunker and index schema changed in this release, so an existing dense index must be rebuilt once. Use `semantic_search()` for conceptual retrieval; it fuses BM25 and dense candidates and applies reranking when enabled. Later refreshes reuse vectors for unchanged source hashes, and a failed endpoint degrades the affected channel rather than disabling lexical `search()`.
 
 ### Atomic Git-Backed Writes
 
@@ -336,7 +336,7 @@ Claude: suggest_links() -> get_link_strength() -> recommend cross-references
 ### Semantic & Similarity (7)
 - `semantic_search` — Hybrid Markdown BM25 and dense retrieval across hierarchical note chunks plus enabled PDF/DOCX text, with optional cross-encoder reranking
 - `embedding_index_status` — Endpoint, model, compatibility, freshness, and attachment-extraction coverage
-- `reindex_embeddings` — Initial or explicit incremental build of the derived dense index
+- `reindex_embeddings` — Start an initial or explicit incremental background build of the derived dense index
 - `find_similar_notes` — Content-similar notes to a given note
 - `find_duplicates` — Near-duplicate detection (SimHash filter + TF-IDF verify)
 - `compare_notes` — Similarity score, shared vocabulary, diff, and merge recommendation

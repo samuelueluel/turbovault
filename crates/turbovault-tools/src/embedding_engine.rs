@@ -292,6 +292,17 @@ pub struct HybridSearchResult {
     pub chunk_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct ReindexProgress {
+    in_progress: bool,
+    phase: Option<String>,
+    processed_chunks: usize,
+    total_chunks: usize,
+    started_at: Option<String>,
+    completed_at: Option<String>,
+    error: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct EmbeddingIndexStatus {
     pub configured: bool,
@@ -314,6 +325,13 @@ pub struct EmbeddingIndexStatus {
     pub document_files_discovered: usize,
     pub document_files_indexed: usize,
     pub document_chunks: usize,
+    pub reindex_in_progress: bool,
+    pub reindex_phase: Option<String>,
+    pub reindex_processed_chunks: usize,
+    pub reindex_total_chunks: usize,
+    pub reindex_started_at: Option<String>,
+    pub reindex_completed_at: Option<String>,
+    pub reindex_error: Option<String>,
     pub reranker_endpoint: String,
     pub reranker_model: String,
     pub reranker_enabled: bool,
@@ -487,6 +505,11 @@ pub struct EmbeddingEngine {
     refresh_guard: tokio::sync::Mutex<()>,
     /// Last lazy-refresh attempt, so a failing endpoint backs off.
     last_refresh_attempt: std::sync::Mutex<Option<Instant>>,
+    /// Prevents two complete index builds from writing the same derived index.
+    reindex_guard: tokio::sync::Mutex<()>,
+    /// Allows the MCP tool to start one long-running build in the background.
+    reindex_running: AtomicBool,
+    reindex_progress: RwLock<ReindexProgress>,
 }
 
 impl EmbeddingEngine {
@@ -545,6 +568,9 @@ impl EmbeddingEngine {
             incompatible: AtomicBool::new(incompatible),
             refresh_guard: tokio::sync::Mutex::new(()),
             last_refresh_attempt: std::sync::Mutex::new(None),
+            reindex_guard: tokio::sync::Mutex::new(()),
+            reindex_running: AtomicBool::new(false),
+            reindex_progress: RwLock::new(ReindexProgress::default()),
         })
     }
 
@@ -555,6 +581,7 @@ impl EmbeddingEngine {
             let _ = self.mark_stale().await;
         }
         let state = self.state.read().await;
+        let progress = self.reindex_progress.read().await.clone();
         let document_chunks = state
             .as_ref()
             .map(|index| {
@@ -599,6 +626,13 @@ impl EmbeddingEngine {
                 .unwrap_or(0),
             document_files_indexed,
             document_chunks,
+            reindex_in_progress: progress.in_progress,
+            reindex_phase: progress.phase,
+            reindex_processed_chunks: progress.processed_chunks,
+            reindex_total_chunks: progress.total_chunks,
+            reindex_started_at: progress.started_at,
+            reindex_completed_at: progress.completed_at,
+            reindex_error: progress.error,
             reranker_endpoint: self.config.reranker_endpoint.clone(),
             reranker_model: self.config.reranker_model.clone(),
             reranker_enabled: self.config.reranker_enabled,
@@ -617,7 +651,47 @@ impl EmbeddingEngine {
         Ok(())
     }
 
+    /// Start a complete rebuild without holding the MCP request open.
+    ///
+    /// The returned status reports `reindex_in_progress=true`; callers should
+    /// poll `status()` until the phase becomes `complete` or `failed`.
+    pub async fn start_reindex(self: &Arc<Self>) -> EmbeddingIndexStatus {
+        if self
+            .reindex_running
+            .compare_exchange(false, true, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
+            .is_err()
+        {
+            return self.status().await;
+        }
+        self.begin_reindex().await;
+        let engine = Arc::clone(self);
+        tokio::spawn(async move {
+            let result = engine.run_reindex().await;
+            engine.finish_reindex(&result).await;
+        });
+        self.status().await
+    }
+
+    /// Synchronous entry point retained for internal refreshes and tests.
+    /// Public MCP callers use `start_reindex` so a full vault build is not
+    /// terminated by a client request timeout.
     pub async fn reindex(&self) -> Result<EmbeddingIndexStatus> {
+        if self
+            .reindex_running
+            .compare_exchange(false, true, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
+            .is_err()
+        {
+            return Err(Error::config_error("embedding reindex is already running"));
+        }
+        self.begin_reindex().await;
+        let result = self.run_reindex().await;
+        self.finish_reindex(&result).await;
+        result
+    }
+
+    async fn run_reindex(&self) -> Result<EmbeddingIndexStatus> {
+        let _guard = self.reindex_guard.lock().await;
+        self.set_reindex_phase("scanning", 0, 0).await;
         self.mark_stale().await?;
         self.manager.ensure_fresh().await;
 
@@ -781,31 +855,36 @@ impl EmbeddingEngine {
             }
         }
 
-        if !pending.is_empty() {
-            for batch in pending.chunks(self.config.batch_size) {
-                let inputs: Vec<String> = batch.iter().map(|chunk| chunk.input.clone()).collect();
-                let vectors = self.embed(&inputs).await?;
-                if vectors.len() != batch.len() {
-                    return Err(Error::other(format!(
-                        "embedding endpoint returned {} vectors for {} inputs",
-                        vectors.len(),
-                        batch.len()
-                    )));
-                }
-                for (pending_chunk, embedding) in batch.iter().zip(vectors) {
-                    final_chunks.push(EmbeddingChunk {
-                        id: pending_chunk.id.clone(),
-                        path: pending_chunk.path.clone(),
-                        title: pending_chunk.title.clone(),
-                        heading: pending_chunk.heading.clone(),
-                        text: pending_chunk.text.clone(),
-                        content_hash: pending_chunk.content_hash.clone(),
-                        embedding,
-                    });
-                }
+        self.set_reindex_phase("embedding", 0, pending.len()).await;
+        let mut processed_chunks = 0;
+        for batch in pending.chunks(self.config.batch_size) {
+            let inputs: Vec<String> = batch.iter().map(|chunk| chunk.input.clone()).collect();
+            let vectors = self.embed(&inputs).await?;
+            if vectors.len() != batch.len() {
+                return Err(Error::other(format!(
+                    "embedding endpoint returned {} vectors for {} inputs",
+                    vectors.len(),
+                    batch.len()
+                )));
             }
+            for (pending_chunk, embedding) in batch.iter().zip(vectors) {
+                final_chunks.push(EmbeddingChunk {
+                    id: pending_chunk.id.clone(),
+                    path: pending_chunk.path.clone(),
+                    title: pending_chunk.title.clone(),
+                    heading: pending_chunk.heading.clone(),
+                    text: pending_chunk.text.clone(),
+                    content_hash: pending_chunk.content_hash.clone(),
+                    embedding,
+                });
+            }
+            processed_chunks += batch.len();
+            self.set_reindex_progress(processed_chunks, pending.len())
+                .await;
         }
 
+        self.set_reindex_phase("writing", processed_chunks, pending.len())
+            .await;
         final_chunks.sort_by(|a, b| a.id.cmp(&b.id));
         let dimension = final_chunks
             .first()
@@ -916,6 +995,41 @@ impl EmbeddingEngine {
         Ok(document_manifest_for(self.manager.vault_path(), &documents) != expected)
     }
 
+    async fn begin_reindex(&self) {
+        let mut progress = self.reindex_progress.write().await;
+        *progress = ReindexProgress {
+            in_progress: true,
+            phase: Some("scanning".to_string()),
+            started_at: Some(Utc::now().to_rfc3339()),
+            ..ReindexProgress::default()
+        };
+    }
+
+    async fn set_reindex_phase(&self, phase: &str, processed: usize, total: usize) {
+        let mut progress = self.reindex_progress.write().await;
+        progress.phase = Some(phase.to_string());
+        progress.processed_chunks = processed;
+        progress.total_chunks = total;
+    }
+
+    async fn set_reindex_progress(&self, processed: usize, total: usize) {
+        let mut progress = self.reindex_progress.write().await;
+        progress.processed_chunks = processed;
+        progress.total_chunks = total;
+    }
+
+    async fn finish_reindex(&self, result: &Result<EmbeddingIndexStatus>) {
+        let mut progress = self.reindex_progress.write().await;
+        progress.in_progress = false;
+        progress.phase = Some(if result.is_ok() { "complete" } else { "failed" }.to_string());
+        progress.completed_at = Some(Utc::now().to_rfc3339());
+        progress.error = result.as_ref().err().map(ToString::to_string);
+        if result.is_ok() {
+            progress.processed_chunks = progress.total_chunks;
+        }
+        self.reindex_running.store(false, AtomicOrdering::Release);
+    }
+
     /// Bring an out-of-date index current before answering, if it has fallen
     /// further behind than the configured threshold.
     ///
@@ -927,7 +1041,8 @@ impl EmbeddingEngine {
     /// vault and stays an explicit choice, while maintaining an existing index
     /// costs only the notes that changed.
     async fn refresh_if_due(&self) -> RefreshReport {
-        if self.config.refresh_after.is_zero() {
+        if self.reindex_running.load(AtomicOrdering::Acquire) || self.config.refresh_after.is_zero()
+        {
             return RefreshReport::default();
         }
         let document_sources_changed = self.config.document_indexing_enabled

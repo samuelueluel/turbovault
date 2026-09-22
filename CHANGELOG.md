@@ -28,6 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Dense reindexing runs in the background.** `reindex_embeddings` now starts the long-running build and returns immediately instead of holding an MCP request open until every embedding batch completes. `embedding_index_status` reports the phase, processed chunk count, total chunk count, completion time, and any terminal error. This avoids client request timeouts during the first full-vault build.
+
 - **Dense index schema and chunker version advanced.** Existing embedding indexes must be rebuilt once. An older binary index now leaves the embedding tools available and reports an incompatible index instead of preventing `reindex_embeddings` from opening.
 
 - **Off the yanked `chacha20`.** 0.10.0 and 0.10.1 are both yanked, so cargo warned on every package

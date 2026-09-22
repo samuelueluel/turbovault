@@ -2304,7 +2304,7 @@
     "annotations": {
       "readOnlyHint": true
     },
-    "description": "Build or rebuild the versioned dense index from hierarchical Markdown chunks and optionally extracted PDF and DOCX text",
+    "description": "Start a background build or rebuild of the versioned dense index from hierarchical Markdown chunks and optional PDF/DOCX text",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
