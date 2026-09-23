@@ -686,6 +686,11 @@ impl CoreToolHandler {
                 .excluded_paths
                 .extend(excluded.iter().cloned());
         }
+        if let Some(ref excluded) = vault_config.excluded_subtrees {
+            server_config
+                .excluded_subtrees
+                .extend(excluded.iter().cloned());
+        }
         vault_config.is_default = true; // Mark as default so VaultManager::new() can find it
         server_config.vaults = vec![vault_config];
 

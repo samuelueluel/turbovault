@@ -356,6 +356,7 @@ mod tests {
             max_file_size: None,
             allowed_extensions: None,
             excluded_paths: None,
+            excluded_subtrees: None,
             enable_caching: None,
             cache_ttl: None,
             template_dirs: None,

@@ -225,7 +225,8 @@ config.vaults.push(custom_vault);
 - `watch_for_changes`: Enable file watching for live updates (default: true)
 - `max_file_size`: Maximum file size in bytes (default: 5MB)
 - `allowed_extensions`: File extensions to process (default: `.md`)
-- `excluded_paths`: Paths to exclude from scanning (default: `.obsidian`, `.trash`)
+- `excluded_paths`: Exclude matching path components throughout the vault (default: `.obsidian`, `.trash`)
+- `excluded_subtrees`: Exclude exact vault-root-relative paths and all descendants; unlike `excluded_paths`, these do not match same-named folders elsewhere
 - `enable_caching`: Enable file content caching (default: true)
 - `cache_ttl`: Cache time-to-live in seconds (default: 300 = 5 minutes)
 - `template_dirs`: Additional template directories (default: vault root)

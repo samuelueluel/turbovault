@@ -111,6 +111,23 @@ fn default_include_ignored() -> bool {
     true
 }
 
+fn validate_excluded_subtrees(paths: &HashSet<PathBuf>) -> Result<()> {
+    for path in paths {
+        if path.as_os_str().is_empty()
+            || path.is_absolute()
+            || path
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err(Error::config_error(format!(
+                "Excluded subtree must be a non-empty vault-relative path without '.' or '..': {}",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 // Manual `Default` so `VaultGitConfig::default().include_ignored == true`,
 // matching the serde-default for that field (derive(Default) on a bool yields
 // `false`, which would disagree with the missing-field deserialization).
@@ -143,6 +160,9 @@ pub struct VaultConfig {
     pub max_file_size: Option<u64>,
     pub allowed_extensions: Option<HashSet<String>>,
     pub excluded_paths: Option<HashSet<String>>,
+    /// Vault-root-relative subtrees excluded from scans, note APIs, and retrieval.
+    #[serde(default)]
+    pub excluded_subtrees: Option<HashSet<PathBuf>>,
     pub enable_caching: Option<bool>,
     pub cache_ttl: Option<u64>,
     pub template_dirs: Option<Vec<PathBuf>>,
@@ -167,6 +187,9 @@ impl VaultConfig {
     pub fn validate(&self) -> Result<()> {
         if self.name.is_empty() {
             return Err(Error::config_error("Vault name cannot be empty"));
+        }
+        if let Some(paths) = &self.excluded_subtrees {
+            validate_excluded_subtrees(paths)?;
         }
 
         if !self.path.exists() {
@@ -199,6 +222,7 @@ pub struct VaultConfigBuilder {
     max_file_size: Option<u64>,
     allowed_extensions: Option<HashSet<String>>,
     excluded_paths: Option<HashSet<String>>,
+    excluded_subtrees: Option<HashSet<PathBuf>>,
     enable_caching: Option<bool>,
     cache_ttl: Option<u64>,
     template_dirs: Option<Vec<PathBuf>>,
@@ -218,6 +242,7 @@ impl VaultConfigBuilder {
             max_file_size: None,
             allowed_extensions: None,
             excluded_paths: None,
+            excluded_subtrees: None,
             enable_caching: None,
             cache_ttl: None,
             template_dirs: None,
@@ -236,6 +261,12 @@ impl VaultConfigBuilder {
     /// Set reconcile_external_changes
     pub fn reconcile_external_changes(mut self, watch: bool) -> Self {
         self.reconcile_external_changes = Some(watch);
+        self
+    }
+
+    /// Set vault-root-relative subtrees excluded from scans, note APIs, and retrieval.
+    pub fn excluded_subtrees(mut self, paths: impl IntoIterator<Item = PathBuf>) -> Self {
+        self.excluded_subtrees = Some(paths.into_iter().collect());
         self
     }
 
@@ -267,6 +298,7 @@ impl VaultConfigBuilder {
             max_file_size: self.max_file_size,
             allowed_extensions: self.allowed_extensions,
             excluded_paths: self.excluded_paths,
+            excluded_subtrees: self.excluded_subtrees,
             enable_caching: self.enable_caching,
             cache_ttl: self.cache_ttl,
             template_dirs: self.template_dirs,
@@ -307,6 +339,9 @@ pub struct ServerConfig {
     pub max_file_size: u64,
     pub allowed_extensions: HashSet<String>,
     pub excluded_paths: HashSet<String>,
+    /// Vault-root-relative subtrees excluded from scans, note APIs, and retrieval.
+    #[serde(default)]
+    pub excluded_subtrees: HashSet<PathBuf>,
     pub enable_caching: bool,
     pub cache_ttl: u64,
     pub log_level: String,
@@ -353,6 +388,7 @@ impl Default for ServerConfig {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            excluded_subtrees: HashSet::new(),
             enable_caching: true,
             cache_ttl: 3600,
             log_level: "INFO".to_string(),
@@ -384,6 +420,7 @@ impl ServerConfig {
 
     /// Validate configuration
     pub fn validate(&self) -> Result<()> {
+        validate_excluded_subtrees(&self.excluded_subtrees)?;
         if self.vaults.is_empty() {
             return Err(Error::config_error("At least one vault must be configured"));
         }
@@ -476,6 +513,28 @@ mod tests {
         let mut config = ServerConfig::new();
         config.vaults.clear();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn excluded_subtrees_are_root_relative_and_reject_traversal() {
+        let temp = TempDir::new().unwrap();
+        let vault = VaultConfig::builder("main", temp.path())
+            .excluded_subtrees([PathBuf::from("Agents/private")])
+            .build()
+            .unwrap();
+        assert_eq!(
+            vault.excluded_subtrees.unwrap(),
+            [PathBuf::from("Agents/private")].into_iter().collect()
+        );
+
+        for invalid in [
+            PathBuf::from("../outside"),
+            PathBuf::from("/absolute"),
+            PathBuf::from("."),
+        ] {
+            let result = VaultConfig::builder("main", temp.path()).excluded_subtrees([invalid]);
+            assert!(result.build().is_err());
+        }
     }
 
     // -------- GWS.11 write-backend + git config --------

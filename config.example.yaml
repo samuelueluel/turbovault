@@ -81,6 +81,12 @@ vaults:
       - .trash         # Trash folder
       - .git           # Git folder (hooks are executed on commit)
 
+    # Exact vault-root-relative subtrees; these entries do not match the same
+    # directory name elsewhere in the vault. Each entry also excludes descendants.
+    # excluded_subtrees:
+    #   - 90_Archive
+    #   - Agents/private
+
     # Caching configuration
     enable_caching: true
     cache_ttl: 300           # Cache time-to-live in seconds (5 minutes)

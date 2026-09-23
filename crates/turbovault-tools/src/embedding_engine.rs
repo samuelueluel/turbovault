@@ -541,7 +541,7 @@ impl EmbeddingEngine {
         tokio::fs::create_dir_all(&config.index_dir).await?;
         let index_path = config.index_dir.join("index.bin");
         let stale_path = config.index_dir.join("index.stale");
-        let stale = tokio::fs::try_exists(&stale_path).await.unwrap_or(false);
+        let mut stale = tokio::fs::try_exists(&stale_path).await.unwrap_or(false);
         let mut incompatible = false;
         let state = if tokio::fs::try_exists(&index_path).await.unwrap_or(false) {
             let bytes = tokio::fs::read(&index_path).await.map_err(|error| {
@@ -572,6 +572,15 @@ impl EmbeddingEngine {
         } else {
             None
         };
+        if state
+            .as_ref()
+            .is_some_and(|index| stored_index_has_excluded_sources(index, &manager))
+        {
+            stale = true;
+            log::info!(
+                "embedding index contains newly excluded sources; it will be pruned before the next hybrid search"
+            );
+        }
 
         let client = Client::builder()
             .timeout(Duration::from_secs(180))
@@ -612,6 +621,7 @@ impl EmbeddingEngine {
                     .chunks
                     .iter()
                     .filter(|chunk| is_document_path(&chunk.path))
+                    .filter(|chunk| !source_path_is_excluded(&self.manager, &chunk.path))
                     .count()
             })
             .unwrap_or(0);
@@ -622,6 +632,7 @@ impl EmbeddingEngine {
                     .chunks
                     .iter()
                     .filter(|chunk| is_document_path(&chunk.path))
+                    .filter(|chunk| !source_path_is_excluded(&self.manager, &chunk.path))
                     .map(|chunk| chunk.path.as_str())
                     .collect::<HashSet<_>>()
                     .len()
@@ -636,7 +647,16 @@ impl EmbeddingEngine {
             stale: self.stale.load(AtomicOrdering::Acquire),
             incompatible: self.incompatible.load(AtomicOrdering::Acquire),
             exists: state.is_some(),
-            chunks: state.as_ref().map(|index| index.chunks.len()).unwrap_or(0),
+            chunks: state
+                .as_ref()
+                .map(|index| {
+                    index
+                        .chunks
+                        .iter()
+                        .filter(|chunk| !source_path_is_excluded(&self.manager, &chunk.path))
+                        .count()
+                })
+                .unwrap_or(0),
             dimensions: state.as_ref().map(|index| index.dimension).unwrap_or(0),
             built_at: state.as_ref().map(|index| index.built_at.clone()),
             schema_version: state.as_ref().map(|index| index.schema_version),
@@ -645,7 +665,13 @@ impl EmbeddingEngine {
             document_max_bytes: self.config.document_max_bytes,
             document_files_discovered: state
                 .as_ref()
-                .map(|index| index.document_manifest.len())
+                .map(|index| {
+                    index
+                        .document_manifest
+                        .iter()
+                        .filter(|document| !source_path_is_excluded(&self.manager, &document.path))
+                        .count()
+                })
                 .unwrap_or(0),
             document_files_indexed,
             document_chunks,
@@ -967,6 +993,12 @@ impl EmbeddingEngine {
                 "no embedding index exists; run reindex_embeddings before read_passage",
             )
         })?;
+        self.manager.resolve_path(Path::new(path))?;
+        if source_path_is_excluded(&self.manager, path) {
+            return Err(Error::config_error(
+                "passage path is excluded by vault policy",
+            ));
+        }
         expand_passage(
             index,
             path,
@@ -1014,6 +1046,7 @@ impl EmbeddingEngine {
         let mut ranked: Vec<(f64, &EmbeddingChunk)> = index
             .chunks
             .iter()
+            .filter(|chunk| !source_path_is_excluded(&self.manager, &chunk.path))
             .filter_map(|chunk| {
                 let score = cosine_similarity(query_vector, &chunk.embedding);
                 score.is_finite().then_some((score, chunk))
@@ -1048,6 +1081,13 @@ impl EmbeddingEngine {
             .manager
             .scan_files_by_extensions(&["pdf", "docx"], self.config.document_max_bytes)?;
         Ok(document_manifest_for(self.manager.vault_path(), &documents) != expected)
+    }
+
+    async fn index_has_excluded_sources(&self) -> bool {
+        let state = self.state.read().await;
+        state
+            .as_ref()
+            .is_some_and(|index| stored_index_has_excluded_sources(index, &self.manager))
     }
 
     async fn begin_reindex(&self) {
@@ -1100,6 +1140,10 @@ impl EmbeddingEngine {
         {
             return RefreshReport::default();
         }
+        let excluded_sources_present = self.index_has_excluded_sources().await;
+        if excluded_sources_present {
+            let _ = self.mark_stale().await;
+        }
         let document_sources_changed = self.config.document_indexing_enabled
             && self.document_sources_changed().await.unwrap_or(false);
         if document_sources_changed {
@@ -1112,7 +1156,8 @@ impl EmbeddingEngine {
                 Some(index) => index.built_at.clone(),
             }
         };
-        if !document_sources_changed
+        if !excluded_sources_present
+            && !document_sources_changed
             && !refresh_due(
                 self.stale.load(AtomicOrdering::Acquire),
                 Some(&built_at),
@@ -1136,7 +1181,11 @@ impl EmbeddingEngine {
         if let Ok(mut last) = self.last_refresh_attempt.lock() {
             *last = Some(Instant::now());
         }
-        if document_sources_changed {
+        if excluded_sources_present {
+            log::info!(
+                "excluded source content remains in the embedding index; pruning it before search"
+            );
+        } else if document_sources_changed {
             log::info!("PDF or DOCX attachments changed; refreshing the embedding index");
         } else {
             log::info!(
@@ -1194,7 +1243,10 @@ impl EmbeddingEngine {
             .advanced_search(SearchQuery::new(query).limit(candidate_limit))
             .await
         {
-            Ok(results) => results,
+            Ok(results) => results
+                .into_iter()
+                .filter(|result| !source_path_is_excluded(&self.manager, &result.path))
+                .collect(),
             Err(error) => {
                 log::warn!("sparse search unavailable in hybrid retrieval, using dense: {error}");
                 sparse_error = Some(error);
@@ -1983,6 +2035,21 @@ fn is_path_excluded(path: &str) -> bool {
     false
 }
 
+fn source_path_is_excluded(manager: &VaultManager, path: &str) -> bool {
+    is_path_excluded(path) || manager.is_path_excluded(Path::new(path))
+}
+
+fn stored_index_has_excluded_sources(index: &StoredIndex, manager: &VaultManager) -> bool {
+    index
+        .chunks
+        .iter()
+        .any(|chunk| source_path_is_excluded(manager, &chunk.path))
+        || index
+            .document_manifest
+            .iter()
+            .any(|document| source_path_is_excluded(manager, &document.path))
+}
+
 #[derive(Clone)]
 struct HybridAccumulator {
     path: String,
@@ -2144,6 +2211,7 @@ fn expand_passage(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     fn passage_fixture() -> StoredIndex {
         let chunk = |path: &str, n: usize, heading: &str, text: &str| EmbeddingChunk {
@@ -2521,6 +2589,60 @@ mod tests {
         assert!(is_path_excluded(".obsidian/workspace.json"));
         assert!(!is_path_excluded("10_Projects/note.md"));
         assert!(!is_path_excluded("trash_collection/note.md"));
+    }
+
+    #[tokio::test]
+    async fn excluded_subtrees_are_removed_from_existing_rag_candidates() {
+        let temp = TempDir::new().unwrap();
+        let vault = VaultConfig::builder("test", temp.path())
+            .excluded_subtrees(
+                ["Agents", "Chats", "90_Archive"]
+                    .into_iter()
+                    .map(PathBuf::from),
+            )
+            .build()
+            .unwrap();
+        let mut config = ServerConfig::new();
+        config.vaults.push(vault);
+        let manager = VaultManager::new(config).unwrap();
+
+        let chunk = |path: &str| EmbeddingChunk {
+            id: format!("{path}#0"),
+            path: path.into(),
+            title: "Fixture".into(),
+            heading: None,
+            text: format!("content from {path}"),
+            content_hash: "source".into(),
+            embedding: vec![1.0],
+        };
+        let mut index = passage_fixture();
+        index.chunks = [
+            "Agents/private/deep.md",
+            "Chats/session.md",
+            "90_Archive/old.md",
+            "projects/Agents/visible.md",
+            "Agents-old/visible.md",
+            "visible.md",
+        ]
+        .into_iter()
+        .map(chunk)
+        .collect();
+
+        let visible: Vec<&str> = index
+            .chunks
+            .iter()
+            .filter(|chunk| !source_path_is_excluded(&manager, &chunk.path))
+            .map(|chunk| chunk.path.as_str())
+            .collect();
+        assert_eq!(
+            visible,
+            [
+                "projects/Agents/visible.md",
+                "Agents-old/visible.md",
+                "visible.md"
+            ]
+        );
+        assert!(stored_index_has_excluded_sources(&index, &manager));
     }
 
     #[test]

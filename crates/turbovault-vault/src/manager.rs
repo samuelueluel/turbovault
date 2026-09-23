@@ -73,6 +73,27 @@ pub type ChangeListener =
 /// so unlike [`ServerConfig::excluded_paths`] this list is not configurable.
 pub const PROTECTED_COMPONENTS: [&str; 1] = [".turbovault"];
 
+/// Match a vault-relative path against an excluded subtree, respecting the
+/// native filesystem's case rules while comparing whole path components.
+fn path_is_in_excluded_subtree(path: &Path, subtree: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        let mut path_components = path.components();
+        subtree.components().all(|excluded_component| {
+            path_components.next().is_some_and(|path_component| {
+                path_component
+                    .as_os_str()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&excluded_component.as_os_str().to_string_lossy())
+            })
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        path.starts_with(subtree)
+    }
+}
+
 /// One note found by a vault scan, with the metadata the scan already read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScannedNote {
@@ -250,7 +271,8 @@ impl Drop for WriteClaim<'_> {
 #[derive(Debug, Clone)]
 struct ScanSpec {
     root: PathBuf,
-    excluded: HashSet<String>,
+    excluded_components: HashSet<String>,
+    excluded_subtrees: HashSet<PathBuf>,
     /// Admitted extensions, lower-cased and *without* the leading dot, so the
     /// per-entry test is a hash lookup on the raw `Path::extension` slice in
     /// the overwhelmingly common already-lower-case case.
@@ -260,15 +282,20 @@ struct ScanSpec {
 
 impl ScanSpec {
     fn new(config: &ServerConfig, root: PathBuf) -> Self {
-        let mut excluded = config.excluded_paths.clone();
-        if let Ok(default_vault) = config.default_vault()
-            && let Some(ref vault_excluded) = default_vault.excluded_paths
-        {
-            excluded.extend(vault_excluded.iter().cloned());
+        let mut excluded_components = config.excluded_paths.clone();
+        let mut excluded_subtrees = config.excluded_subtrees.clone();
+        if let Ok(default_vault) = config.default_vault() {
+            if let Some(ref vault_excluded) = default_vault.excluded_paths {
+                excluded_components.extend(vault_excluded.iter().cloned());
+            }
+            if let Some(ref vault_excluded) = default_vault.excluded_subtrees {
+                excluded_subtrees.extend(vault_excluded.iter().cloned());
+            }
         }
         Self {
             root,
-            excluded,
+            excluded_components,
+            excluded_subtrees,
             allowed_extensions: config
                 .allowed_extensions
                 .iter()
@@ -287,6 +314,24 @@ impl ScanSpec {
         self.allowed_extensions.contains(ext)
             || (ext.bytes().any(|b| b.is_ascii_uppercase())
                 && self.allowed_extensions.contains(&ext.to_lowercase()))
+    }
+
+    /// Return the matching protected component or configured subtree, if any.
+    fn excluded_reason(&self, relative: &Path) -> Option<String> {
+        for component in relative.components() {
+            if let std::path::Component::Normal(raw) = component {
+                let name = raw.to_string_lossy();
+                if PROTECTED_COMPONENTS.contains(&name.as_ref())
+                    || self.excluded_components.contains(name.as_ref())
+                {
+                    return Some(name.into_owned());
+                }
+            }
+        }
+        self.excluded_subtrees
+            .iter()
+            .find(|subtree| path_is_in_excluded_subtree(relative, subtree))
+            .map(|subtree| subtree.to_string_lossy().into_owned())
     }
 
     /// Walk the vault and return every note the configuration admits, carrying
@@ -319,13 +364,12 @@ impl ScanSpec {
 
             for entry in entries.flatten() {
                 let path = entry.path();
-                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                let Ok(relative) = path.strip_prefix(&self.root) else {
                     continue;
                 };
-                if PROTECTED_COMPONENTS.contains(&name) || self.excluded.contains(name) {
+                if self.excluded_reason(relative).is_some() {
                     continue;
                 }
-
                 // `file_type` reads `d_type` straight off the dirent where the
                 // platform supplies it, so the test costs no extra syscall, and
                 // it describes the link itself rather than its target.
@@ -1519,7 +1563,7 @@ impl VaultManager {
     }
 
     /// Refuse a path that lies inside the vault but under a protected
-    /// directory.
+    /// component or configured excluded subtree.
     ///
     /// Staying inside the vault root is not sufficient authorization. A vault
     /// also contains application and tool state whose contents are executed or
@@ -1529,10 +1573,10 @@ impl VaultManager {
     /// Exposing those through a note read/write turns "edit my notes" into code
     /// execution and makes the audit log self-editable.
     ///
-    /// The configurable part is [`VaultConfig::excluded_paths`], which already
-    /// defaults to `.obsidian`/`.git`/`node_modules`/`.DS_Store` — until now it
-    /// only filtered directory scans, so the policy existed without being
-    /// enforced at the point of access. [`PROTECTED_COMPONENTS`] is the part no
+    /// [`VaultConfig::excluded_paths`] excludes matching components throughout
+    /// the vault; [`VaultConfig::excluded_subtrees`] excludes exact
+    /// vault-root-relative paths and their descendants. Both policies apply to
+    /// scans and direct access. [`PROTECTED_COMPONENTS`] is the part no
     /// configuration can open up.
     ///
     /// Note that `allowed_extensions` is deliberately NOT enforced here: it
@@ -1543,18 +1587,37 @@ impl VaultManager {
         let Ok(relative) = resolved.strip_prefix(&self.vault_path) else {
             return Ok(());
         };
-        for component in relative.components() {
-            let std::path::Component::Normal(raw) = component else {
-                continue;
-            };
-            let name = raw.to_string_lossy();
-            if PROTECTED_COMPONENTS.contains(&name.as_ref())
-                || self.config.excluded_paths.contains(name.as_ref())
-            {
-                return Err(Error::protected_path(resolved, name.into_owned()));
-            }
+        if let Some(reason) = self.scan_spec.excluded_reason(relative) {
+            return Err(Error::protected_path(resolved, reason));
         }
         Ok(())
+    }
+
+    /// Check whether a vault-relative source path is excluded by the active
+    /// note-tool policy. This is a policy check only; caller-supplied paths must
+    /// still go through [`Self::resolve_path`] for traversal validation.
+    pub fn is_path_excluded(&self, path: &Path) -> bool {
+        let relative = if path.is_absolute() {
+            let Ok(relative) = path.strip_prefix(&self.vault_path) else {
+                return true;
+            };
+            relative
+        } else {
+            path
+        };
+        if relative.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        }) {
+            return true;
+        }
+        self.scan_spec
+            .excluded_reason(&Self::normalize_path(relative))
+            .is_some()
     }
 
     /// Scan for markdown files in vault
@@ -2809,6 +2872,108 @@ mod tests {
     }
 
     // ── scan_vault ───────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_excluded_subtrees_are_root_relative_and_block_tool_paths() {
+        let temp_dir = TempDir::new().unwrap();
+        for (path, content) in [
+            ("Agents/private/deep.md", "secret agent note"),
+            ("Agents/private/secret.pdf", "secret attachment"),
+            ("projects/Agents/visible.pdf", "allowed attachment"),
+            ("Chats/session.md", "private chat"),
+            ("90_Archive/old.md", "archived note"),
+            (
+                "projects/Agents/visible.md",
+                "allowed nested same-name folder",
+            ),
+            ("Agents-old/visible.md", "allowed name prefix"),
+            ("visible.md", "allowed root note"),
+        ] {
+            let full_path = temp_dir.path().join(path);
+            std::fs::create_dir_all(full_path.parent().unwrap()).unwrap();
+            std::fs::write(full_path, content).unwrap();
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let lower_case = temp_dir.path().join("agents/lower.md");
+            std::fs::create_dir_all(lower_case.parent().unwrap()).unwrap();
+            std::fs::write(lower_case, "different Linux path").unwrap();
+        }
+
+        let vault = VaultConfig::builder("test_vault", temp_dir.path())
+            .excluded_subtrees(
+                ["Agents", "Chats", "90_Archive"]
+                    .into_iter()
+                    .map(PathBuf::from),
+            )
+            .build()
+            .unwrap();
+        let mut config = ServerConfig::new();
+        config.vaults.push(vault);
+        let manager = VaultManager::new(config).unwrap();
+
+        let mut scanned: Vec<String> = manager
+            .scan_vault()
+            .await
+            .unwrap()
+            .iter()
+            .map(|path| {
+                path.strip_prefix(temp_dir.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        scanned.sort();
+        let mut expected = vec![
+            "Agents-old/visible.md",
+            "projects/Agents/visible.md",
+            "visible.md",
+        ];
+        #[cfg(target_os = "linux")]
+        expected.push("agents/lower.md");
+        expected.sort();
+        assert_eq!(scanned, expected);
+
+        let documents = manager.scan_files_by_extensions(&["pdf"], 100).unwrap();
+        assert_eq!(documents.len(), 1);
+        assert!(documents[0].path.ends_with("projects/Agents/visible.pdf"));
+
+        for excluded in [
+            "Agents",
+            "Agents/private/deep.md",
+            "Agents/private/secret.pdf",
+            "Chats/session.md",
+            "90_Archive/old.md",
+        ] {
+            assert!(
+                manager.resolve_path(Path::new(excluded)).is_err(),
+                "expected {excluded} to be blocked"
+            );
+        }
+        for allowed in [
+            "projects/Agents/visible.md",
+            "Agents-old/visible.md",
+            "visible.md",
+        ] {
+            assert!(
+                manager.resolve_path(Path::new(allowed)).is_ok(),
+                "expected {allowed} to remain accessible"
+            );
+        }
+        #[cfg(target_os = "linux")]
+        assert!(manager.resolve_path(Path::new("agents/lower.md")).is_ok());
+        #[cfg(windows)]
+        {
+            assert!(
+                manager
+                    .resolve_path(Path::new("agents/private/deep.md"))
+                    .is_err()
+            );
+            assert!(manager.resolve_path(Path::new("AGENTS")).is_err());
+        }
+    }
 
     /// The scan must recurse into nested subdirectories.
     #[tokio::test]
