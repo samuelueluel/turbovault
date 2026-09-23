@@ -476,7 +476,7 @@ impl AnalysisProvider {
         description = "Search Markdown, PDF, and DOCX passages by semantic similarity using hybrid neural retrieval (BM25 + configurable dense embeddings + optional cross-encoder reranking)",
         usage = "Use as the primary semantic search route for conceptual questions, topics, and natural language descriptions. Fuses Markdown BM25 retrieval with dense hierarchical chunks, including locally extracted PDF and DOCX text when attachment indexing is enabled, then optionally re-scores top candidates through the configured reranker endpoint",
         performance = "Moderate after indexing; executes sparse search, dense embedding query, and cross-encoder reranking",
-        related = ["search", "advanced_search", "reindex_embeddings", "embedding_index_status", "read_note"],
+        related = ["search", "advanced_search", "read_passage", "reindex_embeddings", "embedding_index_status", "read_note"],
         examples = ["semantic_search(query='mechanisms linking zoning restrictions to rent burdens')", "semantic_search(query='how to format Stata do-files consistently', limit=15)"],
         tags = ["read", "search", "semantic", "embeddings"],
         read_only = true,
@@ -504,7 +504,12 @@ impl AnalysisProvider {
         )
         .with_count(count)
         .with_duration(start.elapsed().as_millis() as u64)
-        .with_next_steps(&["read_note", "get_backlinks", "advanced_search"]);
+        .with_next_steps(&[
+            "read_passage",
+            "read_note",
+            "get_backlinks",
+            "advanced_search",
+        ]);
 
         // Surface every degradation as a sentence the caller can relay verbatim.
         // Without this the only evidence is a null score on each row, which is
@@ -534,6 +539,48 @@ impl AnalysisProvider {
             serde_json::to_value(diagnostics)
                 .map_err(|error| McpError::internal(error.to_string()))?,
         );
+        response.to_json()
+    }
+
+    #[tool(
+        description = "Reopen an exact indexed semantic-search passage with bounded same-section neighbors and source provenance",
+        usage = "Pass path, chunk_id, and chunk_hash from a semantic_search hit. Reopens stored text without reranking or assigning the anchor's score to neighbors. Read the source note for current context; a stale index may not reflect edits.",
+        performance = "Fast local index lookup; no inference call",
+        related = ["semantic_search", "read_note", "embedding_index_status"],
+        examples = ["read_passage(path='notes/plan.md', chunk_id='notes/plan.md#2', expected_hash='<chunk_hash>', neighbors=1, max_chars=3000)"],
+        tags = ["read", "search", "semantic", "evidence"],
+        read_only = true,
+    )]
+    async fn read_passage(
+        &self,
+        path: String,
+        chunk_id: String,
+        expected_hash: String,
+        neighbors: Option<usize>,
+        max_chars: Option<usize>,
+    ) -> McpResult<serde_json::Value> {
+        let start = std::time::Instant::now();
+        let (vault_name, _) = self.get_vault_pair().await?;
+        let engine = self.get_embedding_engine().await?;
+        let passage = engine
+            .read_passage(
+                &path,
+                &chunk_id,
+                &expected_hash,
+                neighbors.unwrap_or(1),
+                max_chars.unwrap_or(4_000),
+            )
+            .await
+            .map_err(to_mcp_error)?;
+        let stale = passage.index_stale;
+        let mut response = StandardResponse::new(&vault_name, "read_passage", passage)
+            .with_duration(start.elapsed().as_millis() as u64)
+            .with_next_steps(&["read_note", "semantic_search"]);
+        if stale {
+            response = response.with_warning(
+                "The embedding index is stale; read the source note to verify current content.",
+            );
+        }
         response.to_json()
     }
 

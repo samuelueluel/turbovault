@@ -224,7 +224,7 @@ Scanned PDFs without a text layer are skipped because they require OCR; legacy `
 
 The vector index stays outside the vault. Its default root is `%LOCALAPPDATA%\turbovault\embeddings` on Windows and `$XDG_CACHE_HOME/turbovault/embeddings` or `~/.cache/turbovault/embeddings` elsewhere. Override it with `TURBOVAULT_EMBEDDING_INDEX_DIR`.
 
-After connecting an MCP client, call `embedding_index_status()` and then run `reindex_embeddings()` once. The command starts a background build and returns immediately; poll `embedding_index_status()` until `reindex_phase` is `complete` or `failed`. The chunker and index schema changed in this release, so an existing dense index must be rebuilt once. Use `semantic_search()` for conceptual retrieval; it fuses BM25 and dense candidates and applies reranking when enabled. Later refreshes reuse vectors for unchanged source hashes, and a failed endpoint degrades the affected channel rather than disabling lexical `search()`.
+After connecting an MCP client, call `embedding_index_status()` and then run `reindex_embeddings()` once. The command starts a background build and returns immediately; poll `embedding_index_status()` until `reindex_phase` is `complete` or `failed`. The chunker and index schema changed in this release, so an existing dense index must be rebuilt once. Use `semantic_search()` for conceptual retrieval; it fuses BM25 and dense candidates and applies reranking when enabled. Later refreshes reuse vectors for unchanged source hashes, and a failed endpoint degrades the affected channel rather than disabling lexical `search()`. To inspect more context without inflating every search result, pass a hit's `path`, `chunk_id`, and `chunk_hash` to `read_passage(path, chunk_id, expected_hash, neighbors=1, max_chars=4000)`. It returns the anchor and bounded neighbors from the same top-level section in the stored index; it does not rank neighbors or verify current note content. A stale-index warning means you should check `read_note()` for the latest Markdown text. Never infer page-image verification from extracted PDF/DOCX passages. For a read-only live-vault retrieval battery, see `tests/vault_retrieval_benchmark.py` (requires an explicitly supplied vault, binary, and **private** JSON query fixture). Keep personal note paths and questions out of this public repository. `tests/test_vault_retrieval_benchmark.py` runs a disposable synthetic-vault MCP round trip.
 
 ### Atomic Git-Backed Writes
 
@@ -287,7 +287,7 @@ You: "Based on my vault, what notes should I link this to?"
 Claude: suggest_links() -> get_link_strength() -> recommend cross-references
 ```
 
-## 74 MCP Tools Organized by Category
+## 77 MCP Tools Organized by Category
 
 ### File Operations & Batch (8)
 - `read_note` — Get note content with hash for conflict detection
@@ -333,8 +333,9 @@ Claude: suggest_links() -> get_link_strength() -> recommend cross-references
 - `inspect_frontmatter` — Schema inspection for SQL queries (feature: `sql`)
 - `query_frontmatter_sql` — Arbitrary SQL against frontmatter via GlueSQL (feature: `sql`)
 
-### Semantic & Similarity (7)
+### Semantic & Similarity (8)
 - `semantic_search` — Hybrid Markdown BM25 and dense retrieval across hierarchical note chunks plus enabled PDF/DOCX text, with optional cross-encoder reranking
+- `read_passage` — Reopen one hash-guarded indexed chunk and bounded same-section neighbors; not a replacement for checking the current source note
 - `embedding_index_status` — Endpoint, model, compatibility, freshness, and attachment-extraction coverage
 - `reindex_embeddings` — Start an initial or explicit incremental background build of the derived dense index
 - `find_similar_notes` — Content-similar notes to a given note

@@ -290,6 +290,29 @@ pub struct HybridSearchResult {
     pub rerank_score: Option<f64>,
     pub rerank_rank: Option<usize>,
     pub chunk_id: Option<String>,
+    /// SHA-256 of the returned passage text; pass it to read_passage to avoid
+    /// accepting a reused ordinal after an index refresh.
+    pub chunk_hash: Option<String>,
+}
+
+/// A passage reopened from the persisted index, never assigned a search score.
+#[derive(Debug, Clone, Serialize)]
+pub struct IndexedPassage {
+    pub chunk_id: String,
+    pub heading: Option<String>,
+    pub text: String,
+    pub truncated: bool,
+    pub anchor: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PassageRead {
+    pub path: String,
+    pub anchor_id: String,
+    pub anchor_hash: String,
+    pub built_at: String,
+    pub index_stale: bool,
+    pub chunks: Vec<IndexedPassage>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -921,6 +944,38 @@ impl EmbeddingEngine {
         // The index just written necessarily matches the current configuration.
         self.incompatible.store(false, AtomicOrdering::Release);
         Ok(self.status().await)
+    }
+
+    /// Reopen one exact search hit with bounded, same-section neighboring chunks.
+    /// No embedding request, reranking, or score inheritance occurs here.
+    pub async fn read_passage(
+        &self,
+        path: &str,
+        chunk_id: &str,
+        expected_hash: &str,
+        neighbors: usize,
+        max_chars: usize,
+    ) -> Result<PassageRead> {
+        if self.incompatible.load(AtomicOrdering::Acquire) {
+            return Err(Error::config_error(
+                "embedding index is incompatible; run reindex_embeddings",
+            ));
+        }
+        let state = self.state.read().await;
+        let index = state.as_ref().ok_or_else(|| {
+            Error::config_error(
+                "no embedding index exists; run reindex_embeddings before read_passage",
+            )
+        })?;
+        expand_passage(
+            index,
+            path,
+            chunk_id,
+            expected_hash,
+            neighbors.min(3),
+            max_chars.clamp(1, 12_000),
+            self.stale.load(AtomicOrdering::Acquire),
+        )
     }
 
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<EmbeddingSearchResult>> {
@@ -1977,6 +2032,10 @@ impl HybridAccumulator {
     }
 
     fn finish(self) -> HybridSearchResult {
+        let chunk_hash = self
+            .chunk_id
+            .as_ref()
+            .map(|_| hex_hash(self.text.as_bytes()));
         HybridSearchResult {
             path: self.path,
             title: self.title,
@@ -1991,14 +2050,188 @@ impl HybridAccumulator {
             sparse_rank: self.sparse_rank,
             rerank_score: self.rerank_score,
             rerank_rank: self.rerank_rank,
+            chunk_hash,
             chunk_id: self.chunk_id,
         }
     }
 }
 
+fn root_heading(heading: Option<&str>) -> Option<&str> {
+    heading.map(|value| value.split(" > ").next().unwrap_or(value))
+}
+
+fn expand_passage(
+    index: &StoredIndex,
+    path: &str,
+    chunk_id: &str,
+    expected_hash: &str,
+    neighbors: usize,
+    max_chars: usize,
+    stale: bool,
+) -> Result<PassageRead> {
+    // Require an exact path–ID pair and the returned text hash. Ordinals alone
+    // are not immutable: a reindex can reuse #N for a different passage.
+    let mut chunks: Vec<&EmbeddingChunk> = index.chunks.iter().filter(|c| c.path == path).collect();
+    chunks.sort_by_key(|c| {
+        c.id.rsplit_once('#')
+            .and_then(|(_, n)| n.parse::<usize>().ok())
+    });
+    let pos = chunks
+        .iter()
+        .position(|c| c.id == chunk_id)
+        .ok_or_else(|| {
+            Error::config_error(
+                "passage anchor not found for this exact path; rerun semantic_search",
+            )
+        })?;
+    let anchor = chunks[pos];
+    let actual_hash = hex_hash(anchor.text.as_bytes());
+    if actual_hash != expected_hash {
+        return Err(Error::config_error(
+            "passage anchor changed since search; rerun semantic_search",
+        ));
+    }
+    let root = root_heading(anchor.heading.as_deref());
+    let mut positions = vec![pos];
+    for step in 1..=neighbors.min(3) {
+        for candidate in [
+            pos.checked_sub(step),
+            pos.checked_add(step).filter(|p| *p < chunks.len()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if root_heading(chunks[candidate].heading.as_deref()) == root {
+                positions.push(candidate);
+            }
+        }
+    }
+    // The anchor spends the budget first. Neighbors are only context and never
+    // displace the ranked passage; the final response returns document order.
+    let mut remaining = max_chars.clamp(1, 12_000);
+    let mut selected = Vec::new();
+    for position in positions {
+        if remaining == 0 {
+            break;
+        }
+        let chunk = chunks[position];
+        let original_chars = chunk.text.chars().count();
+        let text: String = chunk.text.chars().take(remaining).collect();
+        let used = text.chars().count();
+        remaining -= used;
+        selected.push((
+            position,
+            IndexedPassage {
+                chunk_id: chunk.id.clone(),
+                heading: chunk.heading.clone(),
+                text,
+                truncated: used < original_chars,
+                anchor: position == pos,
+            },
+        ));
+    }
+    selected.sort_by_key(|(position, _)| *position);
+    Ok(PassageRead {
+        path: path.to_string(),
+        anchor_id: chunk_id.to_string(),
+        anchor_hash: actual_hash,
+        built_at: index.built_at.clone(),
+        index_stale: stale,
+        chunks: selected.into_iter().map(|(_, passage)| passage).collect(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn passage_fixture() -> StoredIndex {
+        let chunk = |path: &str, n: usize, heading: &str, text: &str| EmbeddingChunk {
+            id: format!("{path}#{n}"),
+            path: path.into(),
+            title: "Fixture".into(),
+            heading: Some(heading.into()),
+            text: text.into(),
+            content_hash: "source".into(),
+            embedding: vec![1.0],
+        };
+        StoredIndex {
+            schema_version: INDEX_SCHEMA_VERSION,
+            chunker_version: CHUNKER_VERSION.into(),
+            model: DEFAULT_MODEL.into(),
+            vault_path: "/fixture".into(),
+            dimension: 1,
+            built_at: "2026-01-01T00:00:00Z".into(),
+            document_indexing_enabled: false,
+            document_max_bytes: DEFAULT_DOCUMENT_MAX_BYTES as u64,
+            document_manifest: vec![],
+            chunks: vec![
+                chunk("one.md", 0, "First", "intro"),
+                chunk("one.md", 1, "First > Detail", "éclat 🎉 data"),
+                chunk("one.md", 2, "First > More", "ending"),
+                chunk("one.md", 3, "Second", "unrelated"),
+                chunk("two.md", 0, "First", "other note"),
+            ],
+        }
+    }
+
+    #[test]
+    fn passage_expansion_is_bounded_same_section_and_anchor_first() {
+        let index = passage_fixture();
+        let hash = hex_hash("éclat 🎉 data".as_bytes());
+        let read = expand_passage(&index, "one.md", "one.md#1", &hash, 3, 20, true).unwrap();
+        assert!(read.index_stale);
+        assert_eq!(
+            read.chunks
+                .iter()
+                .map(|c| c.chunk_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["one.md#0", "one.md#1", "one.md#2"]
+        );
+        assert_eq!(
+            read.chunks
+                .iter()
+                .map(|c| c.text.chars().count())
+                .sum::<usize>(),
+            20
+        );
+        assert_eq!(
+            read.chunks.iter().find(|c| c.anchor).unwrap().text,
+            "éclat 🎉 data"
+        );
+        assert!(read.chunks.iter().any(|c| c.truncated));
+    }
+
+    #[test]
+    fn passage_rejects_wrong_path_missing_and_reused_ordinal() {
+        let mut index = passage_fixture();
+        let hash = hex_hash("éclat 🎉 data".as_bytes());
+        assert!(expand_passage(&index, "two.md", "one.md#1", &hash, 1, 100, false).is_err());
+        assert!(expand_passage(&index, "one.md", "one.md#19", &hash, 1, 100, false).is_err());
+        index.chunks[1].text = "replaced".into();
+        assert!(expand_passage(&index, "one.md", "one.md#1", &hash, 1, 100, false).is_err());
+    }
+
+    #[test]
+    fn passage_truncates_at_unicode_character_boundary() {
+        let index = passage_fixture();
+        let hash = hex_hash("éclat 🎉 data".as_bytes());
+        let read = expand_passage(&index, "one.md", "one.md#1", &hash, 1, 7, false).unwrap();
+        assert_eq!(read.chunks.len(), 1);
+        assert_eq!(read.chunks[0].text, "éclat 🎉");
+        assert!(read.chunks[0].truncated);
+        let first = expand_passage(
+            &index,
+            "one.md",
+            "one.md#0",
+            &hex_hash(b"intro"),
+            3,
+            100,
+            false,
+        )
+        .unwrap();
+        assert_eq!(first.chunks.len(), 3); // no previous chunk; never crosses the next section
+    }
 
     #[test]
     fn chunker_keeps_subsections_with_parent_when_they_fit() {

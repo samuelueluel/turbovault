@@ -2297,6 +2297,56 @@
       "tags": [
         "read",
         "search",
+        "semantic",
+        "evidence"
+      ]
+    },
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "description": "Reopen an exact indexed semantic-search passage with bounded same-section neighbors and source provenance",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "chunk_id": {
+          "type": "string"
+        },
+        "expected_hash": {
+          "type": "string"
+        },
+        "max_chars": {
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "neighbors": {
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "chunk_id",
+        "expected_hash"
+      ],
+      "type": "object"
+    },
+    "name": "read_passage"
+  },
+  {
+    "_meta": {
+      "tags": [
+        "read",
+        "search",
         "maintenance",
         "embeddings"
       ]
