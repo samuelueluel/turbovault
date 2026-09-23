@@ -299,6 +299,8 @@ Claude: suggest_links() -> get_link_strength() -> recommend cross-references
 - `get_notes_info` — Metadata for multiple notes in a single call
 - `batch_execute` — One all-or-nothing commit with `write_backend: git`; direct stays sequential
 
+`read_note` returns a `uri` that opens the note in a new Obsidian tab (`paneType=tab`). The URI uses each vault's configured folder name, not its TurboVault alias, and encodes the vault-relative note path. For example, a vault at `/home/user/Research Vault` registered as `research` produces `obsidian://open?vault=Research%20Vault&file=notes%2Fwork&paneType=tab` for `notes/work.md`. The same URI is returned by partial note reads.
+
 ### Git Fanout (4)
 - `begin_fanout` — Open an isolated worktree for parallel agent writes
 - `commit_fanout` — Merge an active fanout back into its base vault

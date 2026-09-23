@@ -63,9 +63,16 @@ impl FileProvider {
         last_sections: Option<usize>,
     ) -> McpResult<serde_json::Value> {
         let (vault_name, manager) = self.get_vault_pair().await?;
+        // TurboVault's configured name can be an alias (for example, "personal").
+        // Obsidian URI resolution needs the actual vault folder name instead.
+        let obsidian_vault_name = manager
+            .vault_path()
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_else(|| vault_name.clone().into());
+        let uri = obsidian_uri(&obsidian_vault_name, &path);
         let tools = FileTools::new(manager);
         let content = tools.read_file(&path).await.map_err(to_mcp_error)?;
-        let uri = obsidian_uri(&vault_name, &path);
 
         // `SliceSpec::first_sections` stays available to library callers; it is
         // simply not exposed as a tool parameter. `heading_equals` already

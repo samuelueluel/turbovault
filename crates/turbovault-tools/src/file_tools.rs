@@ -643,14 +643,15 @@ impl FileTools {
     }
 }
 
-/// Generate an Obsidian URI for a note
+/// Generate an Obsidian URI for a note in a new tab.
 ///
-/// Format: obsidian://open?vault=VaultName&file=path/to/note
+/// `vault_name` must be Obsidian's vault folder name, not a TurboVault alias.
+/// Format: obsidian://open?vault=VaultName&file=path/to/note&paneType=tab
 pub fn obsidian_uri(vault_name: &str, file_path: &str) -> String {
     // Strip .md extension for Obsidian URI convention
     let file = file_path.strip_suffix(".md").unwrap_or(file_path);
     format!(
-        "obsidian://open?vault={}&file={}",
+        "obsidian://open?vault={}&file={}&paneType=tab",
         urlencoding::encode(vault_name),
         urlencoding::encode(file)
     )
@@ -846,14 +847,17 @@ mod tests {
         let uri = obsidian_uri("My Vault", "daily/2024-01-15.md");
         assert_eq!(
             uri,
-            "obsidian://open?vault=My%20Vault&file=daily%2F2024-01-15"
+            "obsidian://open?vault=My%20Vault&file=daily%2F2024-01-15&paneType=tab"
         );
     }
 
     #[test]
     fn test_obsidian_uri_no_extension() {
         let uri = obsidian_uri("vault", "folder/note");
-        assert_eq!(uri, "obsidian://open?vault=vault&file=folder%2Fnote");
+        assert_eq!(
+            uri,
+            "obsidian://open?vault=vault&file=folder%2Fnote&paneType=tab"
+        );
     }
 
     #[test]

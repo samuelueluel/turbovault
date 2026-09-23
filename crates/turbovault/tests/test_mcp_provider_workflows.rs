@@ -517,8 +517,46 @@ async fn binary_file_move_enforces_confirmations_hashes_and_vault_boundaries() {
 }
 
 #[tokio::test]
+async fn read_note_uri_uses_each_vault_folder_instead_of_its_alias() {
+    let temp = TempDir::new().expect("temporary parent");
+    let server = ObsidianMcpServer::new().expect("provider composition");
+
+    for (alias, folder, encoded_folder) in [
+        ("research", "Vault One", "Vault%20One"),
+        ("personal", "Budget & Policy", "Budget%20%26%20Policy"),
+    ] {
+        let vault_path = temp.path().join(folder);
+        tokio::fs::create_dir(&vault_path)
+            .await
+            .expect("create vault directory");
+        call(
+            &server,
+            "add_vault",
+            json!({"name": alias, "path": vault_path.to_string_lossy()}),
+        )
+        .await;
+        call(&server, "set_active_vault", json!({"name": alias})).await;
+        write_note(&server, "notes/work.md", "# Work\n").await;
+
+        let expected =
+            format!("obsidian://open?vault={encoded_folder}&file=notes%2Fwork&paneType=tab");
+        let full = call(&server, "read_note", json!({"path": "notes/work.md"})).await;
+        assert_eq!(full["vault"], alias);
+        assert_eq!(full["data"]["uri"], expected);
+
+        let partial = call(
+            &server,
+            "read_note",
+            json!({"path": "notes/work.md", "head_lines": 1}),
+        )
+        .await;
+        assert_eq!(partial["data"]["uri"], expected);
+    }
+}
+
+#[tokio::test]
 async fn file_lifecycle_and_concurrency_guards_work_through_the_public_facade() {
-    let (_temp, server) = registered_server("file-workflow").await;
+    let (temp, server) = registered_server("file-workflow").await;
     let original = "---\ntitle: Work\n---\n# Work\n\nOriginal line.\n";
 
     let written = call(
@@ -547,9 +585,13 @@ async fn file_lifecycle_and_concurrency_guards_work_through_the_public_facade() 
         .expect("initial content hash")
         .to_string();
     assert_eq!(initial_hash.len(), 64);
+    let obsidian_name = temp.path().file_name().expect("vault folder name");
     assert_eq!(
         first_read["data"]["uri"],
-        "obsidian://open?vault=file-workflow&file=notes%2Fwork"
+        format!(
+            "obsidian://open?vault={}&file=notes%2Fwork&paneType=tab",
+            obsidian_name.to_string_lossy()
+        )
     );
 
     let appended = call(
